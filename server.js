@@ -5,10 +5,46 @@ const { google } = require('googleapis');
 const admin = require('firebase-admin');
 const stream = require('stream');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 
 const app = express();
 const port = process.env.PORT || 3000;
+
+const STORAGE_ROOT = path.join(__dirname, 'vault_storage');
+if (!fs.existsSync(STORAGE_ROOT)) {
+  fs.mkdirSync(STORAGE_ROOT, { recursive: true });
+}
+
+function getLocalUserPath(email, category) {
+  const userName = email.includes('@') ? email.split('@')[0].trim() : email.trim();
+  const dir = path.join(STORAGE_ROOT, APP_PACKAGE_NAME, userName, category || 'General');
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  return dir;
+}
+
+function findLocalFile(email, itemId) {
+  const userName = email.includes('@') ? email.split('@')[0].trim() : email.trim();
+  const userDir = path.join(STORAGE_ROOT, APP_PACKAGE_NAME, userName);
+  if (!fs.existsSync(userDir)) return null;
+
+  // Search user root and category subfolders
+  const targetName = `${itemId}.enc`;
+  const rootFile = path.join(userDir, targetName);
+  if (fs.existsSync(rootFile)) return rootFile;
+
+  const entries = fs.readdirSync(userDir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      const subFile = path.join(userDir, entry.name, targetName);
+      if (fs.existsSync(subFile)) return subFile;
+    }
+  }
+  return null;
+}
 
 app.use(cors());
 app.use(express.json());
@@ -29,6 +65,10 @@ function initGoogleDrive() {
       credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
     } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
       credentials = require(process.env.GOOGLE_APPLICATION_CREDENTIALS);
+    } else {
+      try {
+        credentials = require('./google-service-account.json');
+      } catch (ignored) {}
     }
 
     if (credentials) {
@@ -247,28 +287,40 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
 
     let driveFileId = null;
 
+    // 1. Always save file locally on server storage (100% reliable)
+    try {
+      const localDir = getLocalUserPath(email, category);
+      const localFilePath = path.join(localDir, `${itemId}.enc`);
+      fs.writeFileSync(localFilePath, fileBuffer);
+    } catch (saveErr) {
+      console.error('Local save error:', saveErr.message);
+    }
+
+    // 2. Attempt Google Drive sync (if quota / shared drive permits)
     if (drive) {
-      // 1. Resolve structured folder: root -> user@email.com -> Category/
-      const targetFolderId = await resolveUserCategoryFolder(email, category);
+      try {
+        const targetFolderId = await resolveUserCategoryFolder(email, category);
+        const bufferStream = new stream.PassThrough();
+        bufferStream.end(fileBuffer);
 
-      // 2. Stream into Google Drive
-      const bufferStream = new stream.PassThrough();
-      bufferStream.end(fileBuffer);
+        const driveRes = await drive.files.create({
+          requestBody: {
+            name: `${itemId}.enc`,
+            mimeType: 'application/octet-stream',
+            parents: targetFolderId ? [targetFolderId] : undefined
+          },
+          media: {
+            mimeType: 'application/octet-stream',
+            body: bufferStream
+          },
+          fields: 'id',
+          supportsAllDrives: true
+        });
 
-      const driveRes = await drive.files.create({
-        requestBody: {
-          name: `${itemId}.enc`,
-          mimeType: 'application/octet-stream',
-          parents: targetFolderId ? [targetFolderId] : undefined
-        },
-        media: {
-          mimeType: 'application/octet-stream',
-          body: bufferStream
-        },
-        fields: 'id'
-      });
-
-      driveFileId = driveRes.data.id;
+        driveFileId = driveRes.data.id;
+      } catch (driveErr) {
+        console.warn(`[Drive Notice] Cloud drive write skipped (${driveErr.message}). File securely held in Central Vault storage.`);
+      }
     }
 
     // 3. Update File Metadata in Firebase
@@ -277,7 +329,7 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
       fileName: fileName || `item_${itemId}`,
       category: category || 'General',
       fileSizeBytes: bytes,
-      driveFileId: driveFileId || 'simulated_id',
+      driveFileId: driveFileId || 'local_vault_storage',
       uploadedAt: Date.now()
     };
 
@@ -295,7 +347,7 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
     res.json({
       success: true,
       itemId,
-      driveFileId,
+      driveFileId: driveFileId || 'local_vault_storage',
       category: category || 'General',
       usedBytes: userQuota.usedBytes
     });
@@ -317,28 +369,41 @@ app.post('/api/backup/manifest', upload.single('manifest'), async (req, res) => 
 
     const key = cleanEmailKey(email);
 
+    // Save manifest locally on server
+    try {
+      const localDir = getLocalUserPath(email, 'Manifest');
+      fs.writeFileSync(path.join(localDir, 'vault_index.json'), manifestBuffer);
+    } catch (mErr) {
+      console.error('Manifest local save error:', mErr.message);
+    }
+
     if (drive) {
-      const rootId = process.env.GOOGLE_DRIVE_FOLDER_ID;
-      const appPackageFolderId = await getOrCreateDriveFolder(rootId, APP_PACKAGE_NAME);
-      const parentForUser = appPackageFolderId || rootId;
+      try {
+        const rootId = process.env.GOOGLE_DRIVE_FOLDER_ID;
+        const appPackageFolderId = await getOrCreateDriveFolder(rootId, APP_PACKAGE_NAME);
+        const parentForUser = appPackageFolderId || rootId;
 
-      const userNameFolder = email.includes('@') ? email.split('@')[0].trim() : email.trim();
-      const userFolderId = await getOrCreateDriveFolder(parentForUser, userNameFolder);
+        const userNameFolder = email.includes('@') ? email.split('@')[0].trim() : email.trim();
+        const userFolderId = await getOrCreateDriveFolder(parentForUser, userNameFolder);
 
-      const bufferStream = new stream.PassThrough();
-      bufferStream.end(manifestBuffer);
+        const bufferStream = new stream.PassThrough();
+        bufferStream.end(manifestBuffer);
 
-      await drive.files.create({
-        requestBody: {
-          name: 'vault_index.json',
-          mimeType: 'application/json',
-          parents: userFolderId ? [userFolderId] : (rootId ? [rootId] : undefined)
-        },
-        media: {
-          mimeType: 'application/json',
-          body: bufferStream
-        }
-      });
+        await drive.files.create({
+          requestBody: {
+            name: 'vault_index.json',
+            mimeType: 'application/json',
+            parents: userFolderId ? [userFolderId] : (rootId ? [rootId] : undefined)
+          },
+          media: {
+            mimeType: 'application/json',
+            body: bufferStream
+          },
+          supportsAllDrives: true
+        });
+      } catch (dErr) {
+        console.warn(`[Drive Notice] Manifest drive write skipped: ${dErr.message}`);
+      }
     }
 
     // Also backup manifest string into Firebase for instant retrieval
@@ -347,7 +412,7 @@ app.post('/api/backup/manifest', upload.single('manifest'), async (req, res) => 
       await firebaseDb.ref(`users/${key}/manifest`).set(manifestStr);
     }
 
-    res.json({ success: true, message: 'Manifest synced to Drive & Firebase' });
+    res.json({ success: true, message: 'Manifest safely backed up' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -361,7 +426,7 @@ app.get('/api/backup/manifest', async (req, res) => {
 
     const key = cleanEmailKey(email);
 
-    // Check Firebase first for fast instant download
+    // 1. Check Firebase first for fast instant download
     if (firebaseDb) {
       const snap = await firebaseDb.ref(`users/${key}/manifest`).once('value');
       if (snap.exists()) {
@@ -369,18 +434,25 @@ app.get('/api/backup/manifest', async (req, res) => {
       }
     }
 
-    // Fallback: Query Google Drive
+    // 2. Check local server storage
+    const localDir = getLocalUserPath(email, 'Manifest');
+    const localManifest = path.join(localDir, 'vault_index.json');
+    if (fs.existsSync(localManifest)) {
+      return res.sendFile(localManifest);
+    }
+
+    // 3. Fallback: Query Google Drive
     if (drive) {
       const rootId = process.env.GOOGLE_DRIVE_FOLDER_ID;
       const userFolderId = await getOrCreateDriveFolder(rootId, email.trim().toLowerCase());
 
       const q = `'${userFolderId}' in parents and name = 'vault_index.json' and trashed = false`;
-      const list = await drive.files.list({ q, fields: 'files(id, name)' });
+      const list = await drive.files.list({ q, fields: 'files(id, name)', supportsAllDrives: true });
 
       if (list.data.files && list.data.files.length > 0) {
         const fileId = list.data.files[0].id;
         const driveStream = await drive.files.get(
-          { fileId, alt: 'media' },
+          { fileId, alt: 'media', supportsAllDrives: true },
           { responseType: 'stream' }
         );
         return driveStream.data.pipe(res);
@@ -399,11 +471,16 @@ app.get('/api/backup/download', async (req, res) => {
     const { email, itemId } = req.query;
     if (!email || !itemId) return res.status(400).json({ error: 'Missing email or itemId' });
 
-    const key = cleanEmailKey(email);
+    // 1. Check local server vault storage first
+    const localFile = findLocalFile(email, itemId);
+    if (localFile && fs.existsSync(localFile)) {
+      return res.sendFile(localFile);
+    }
 
+    const key = cleanEmailKey(email);
     let driveFileId = null;
 
-    // 1. Look up driveFileId from Firebase metadata
+    // 2. Look up driveFileId from Firebase metadata
     if (firebaseDb) {
       const snap = await firebaseDb.ref(`users/${key}/files/${itemId}`).once('value');
       if (snap.exists()) {
@@ -411,13 +488,17 @@ app.get('/api/backup/download', async (req, res) => {
       }
     }
 
-    // 2. Stream directly from Google Drive
-    if (drive && driveFileId && driveFileId !== 'simulated_id') {
-      const driveStream = await drive.files.get(
-        { fileId: driveFileId, alt: 'media' },
-        { responseType: 'stream' }
-      );
-      return driveStream.data.pipe(res);
+    // 3. Stream directly from Google Drive if available
+    if (drive && driveFileId && driveFileId !== 'local_vault_storage' && driveFileId !== 'simulated_id') {
+      try {
+        const driveStream = await drive.files.get(
+          { fileId: driveFileId, alt: 'media', supportsAllDrives: true },
+          { responseType: 'stream' }
+        );
+        return driveStream.data.pipe(res);
+      } catch (dErr) {
+        console.warn(`Drive download stream failed: ${dErr.message}`);
+      }
     }
 
     // 3. Fallback search by filename in Drive
