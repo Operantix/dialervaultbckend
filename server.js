@@ -220,9 +220,9 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'DialerVault Central Cloud Storage',
-    googleDriveReady: drive !== null,
-    firebaseReady: firebaseDb !== null,
-    version: '1.2.0'
+    googleDriveReady: !!drive,
+    firebaseReady: !!firebaseDb,
+    version: '1.2.1'
   });
 });
 
