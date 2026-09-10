@@ -222,7 +222,16 @@ app.get('/', (req, res) => {
     service: 'DialerVault Central Cloud Storage',
     googleDriveReady: !!drive,
     firebaseReady: !!firebaseDb,
-    version: '1.2.1'
+    version: '1.2.2'
+  });
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    online: true,
+    version: '1.2.2',
+    timestamp: Date.now()
   });
 });
 
