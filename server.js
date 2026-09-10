@@ -296,59 +296,91 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
     const key = cleanEmailKey(email);
     const bytes = parseInt(fileSize, 10) || fileBuffer.length;
 
-    // Check user quota in Firebase / localDb
+    // Check user quota and existing file in Firebase / localDb
     let userQuota = { usedBytes: 0, isLifetime100GB: false };
+    let alreadyTracked = false;
+
     if (firebaseDb) {
       const snap = await firebaseDb.ref(`users/${key}/quota`).once('value');
       if (snap.exists()) userQuota = snap.val();
+
+      const existingFileSnap = await firebaseDb.ref(`users/${key}/files/${itemId}`).once('value');
+      if (existingFileSnap.exists()) {
+        alreadyTracked = true;
+      }
     } else {
       userQuota = localDb.users[key] || userQuota;
+      if (localDb.files[key] && localDb.files[key][itemId]) {
+        alreadyTracked = true;
+      }
     }
 
     const maxAllowed = userQuota.isLifetime100GB ? LIFETIME_LIMIT : FREE_LIMIT;
-    if (userQuota.usedBytes + bytes > maxAllowed) {
+    if (!alreadyTracked && (userQuota.usedBytes + bytes > maxAllowed)) {
       return res.status(403).json({ error: 'Storage quota exceeded for your tier' });
     }
 
     let driveFileId = null;
+    let isDuplicate = false;
 
-    // 1. Always save file locally on server storage (100% reliable)
+    // 1. Always ensure file is saved locally on server storage
     try {
       const localDir = getLocalUserPath(email, category);
       const localFilePath = path.join(localDir, `${itemId}.enc`);
-      fs.writeFileSync(localFilePath, fileBuffer);
+      if (!fs.existsSync(localFilePath)) {
+        fs.writeFileSync(localFilePath, fileBuffer);
+      }
     } catch (saveErr) {
       console.error('Local save error:', saveErr.message);
     }
 
-    // 2. Attempt Google Drive sync (if quota / shared drive permits)
+    // 2. Google Drive check & upload (skips if already exists in Drive)
     if (drive) {
       try {
         const targetFolderId = await resolveUserCategoryFolder(email, category);
-        const bufferStream = new stream.PassThrough();
-        bufferStream.end(fileBuffer);
 
-        const driveRes = await drive.files.create({
-          requestBody: {
-            name: `${itemId}.enc`,
-            mimeType: 'application/octet-stream',
-            parents: targetFolderId ? [targetFolderId] : undefined
-          },
-          media: {
-            mimeType: 'application/octet-stream',
-            body: bufferStream
-          },
-          fields: 'id',
-          supportsAllDrives: true
+        // Check if this exact item ID already exists in the destination folder
+        const existingQuery = `'${targetFolderId}' in parents and name = '${itemId}.enc' and trashed = false`;
+        const existingRes = await drive.files.list({
+          q: existingQuery,
+          fields: 'files(id, name, size)',
+          spaces: 'drive',
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true
         });
 
-        driveFileId = driveRes.data.id;
+        if (existingRes.data.files && existingRes.data.files.length > 0) {
+          driveFileId = existingRes.data.files[0].id;
+          isDuplicate = true;
+          console.log(`ℹ️ [Duplicate Skipped] ${itemId}.enc (${fileName}) already exists in Drive folder (ID: ${driveFileId})`);
+        } else {
+          // File does not exist yet -> Upload once
+          const bufferStream = new stream.PassThrough();
+          bufferStream.end(fileBuffer);
+
+          const driveRes = await drive.files.create({
+            requestBody: {
+              name: `${itemId}.enc`,
+              mimeType: 'application/octet-stream',
+              parents: targetFolderId ? [targetFolderId] : undefined
+            },
+            media: {
+              mimeType: 'application/octet-stream',
+              body: bufferStream
+            },
+            fields: 'id',
+            supportsAllDrives: true
+          });
+
+          driveFileId = driveRes.data.id;
+          console.log(`✅ [Uploaded to Drive] ${itemId}.enc (${fileName}) -> ID: ${driveFileId}`);
+        }
       } catch (driveErr) {
         console.warn(`[Drive Notice] Cloud drive write skipped (${driveErr.message}). File securely held in Central Vault storage.`);
       }
     }
 
-    // 3. Update File Metadata in Firebase
+    // 3. Update File Metadata in Firebase / localDb
     const fileMetadata = {
       itemId,
       fileName: fileName || `item_${itemId}`,
@@ -358,7 +390,9 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
       uploadedAt: Date.now()
     };
 
-    userQuota.usedBytes += bytes;
+    if (!alreadyTracked) {
+      userQuota.usedBytes += bytes;
+    }
 
     if (firebaseDb) {
       await firebaseDb.ref(`users/${key}/files/${itemId}`).set(fileMetadata);
@@ -374,7 +408,9 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
       itemId,
       driveFileId: driveFileId || 'local_vault_storage',
       category: category || 'General',
-      usedBytes: userQuota.usedBytes
+      usedBytes: userQuota.usedBytes,
+      isDuplicate,
+      message: isDuplicate ? 'File already exists in cloud, duplicate skipped.' : 'Successfully uploaded'
     });
   } catch (err) {
     console.error('Upload error:', err);
@@ -382,7 +418,7 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-// Upload Vault Manifest (vault_index.json)
+// Upload Vault Manifest (vault_index.json) - In-place update to prevent duplicates
 app.post('/api/backup/manifest', upload.single('manifest'), async (req, res) => {
   try {
     const { email } = req.body;
@@ -410,22 +446,49 @@ app.post('/api/backup/manifest', upload.single('manifest'), async (req, res) => 
 
         const userNameFolder = email.includes('@') ? email.split('@')[0].trim() : email.trim();
         const userFolderId = await getOrCreateDriveFolder(parentForUser, userNameFolder);
+        const targetParent = userFolderId || rootId;
+
+        // Check if vault_index.json already exists in user folder
+        const checkQuery = `'${targetParent}' in parents and name = 'vault_index.json' and trashed = false`;
+        const existingRes = await drive.files.list({
+          q: checkQuery,
+          fields: 'files(id, name)',
+          spaces: 'drive',
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true
+        });
 
         const bufferStream = new stream.PassThrough();
         bufferStream.end(manifestBuffer);
 
-        await drive.files.create({
-          requestBody: {
-            name: 'vault_index.json',
-            mimeType: 'application/json',
-            parents: userFolderId ? [userFolderId] : (rootId ? [rootId] : undefined)
-          },
-          media: {
-            mimeType: 'application/json',
-            body: bufferStream
-          },
-          supportsAllDrives: true
-        });
+        if (existingRes.data.files && existingRes.data.files.length > 0) {
+          // Update in-place to avoid duplicate files
+          const existingFileId = existingRes.data.files[0].id;
+          await drive.files.update({
+            fileId: existingFileId,
+            media: {
+              mimeType: 'application/json',
+              body: bufferStream
+            },
+            supportsAllDrives: true
+          });
+          console.log(`✅ [Manifest Updated] vault_index.json updated in Drive (ID: ${existingFileId})`);
+        } else {
+          // Create once if doesn't exist yet
+          const createRes = await drive.files.create({
+            requestBody: {
+              name: 'vault_index.json',
+              mimeType: 'application/json',
+              parents: targetParent ? [targetParent] : undefined
+            },
+            media: {
+              mimeType: 'application/json',
+              body: bufferStream
+            },
+            supportsAllDrives: true
+          });
+          console.log(`✅ [Manifest Created] vault_index.json created in Drive (ID: ${createRes.data.id})`);
+        }
       } catch (dErr) {
         console.warn(`[Drive Notice] Manifest drive write skipped: ${dErr.message}`);
       }
