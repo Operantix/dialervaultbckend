@@ -238,7 +238,7 @@ app.get('/', (req, res) => {
     service: 'DialerVault Central Cloud Storage',
     googleDriveReady: !!drive,
     firebaseReady: !!firebaseDb,
-    version: '1.2.2'
+    version: '1.2.3'
   });
 });
 
@@ -246,7 +246,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'healthy',
     online: true,
-    version: '1.2.2',
+    version: '1.2.3',
     timestamp: Date.now()
   });
 });
