@@ -1,5 +1,8 @@
 node_modules/
 .env
 firebase-service-account.json
+google-service-account.json
 credentials.json
+vault_storage/
+railway.env.txt
 *.log

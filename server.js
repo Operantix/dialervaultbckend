@@ -55,11 +55,27 @@ const upload = multer({
   limits: { fileSize: 100 * 1024 * 1024 } // 100MB per file chunk
 });
 
-// 1. Initialize Google Drive API Client using Service Account
+// 1. Initialize Google Drive API Client (Supports OAuth2 for Personal Drive or Service Account)
 let drive = null;
 
 function initGoogleDrive() {
   try {
+    // 1. Prioritize OAuth2 if Refresh Token exists (Uses personal 15 GB quota, bypassing Service Account 0-quota limit)
+    if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && process.env.GOOGLE_REFRESH_TOKEN) {
+      const oauth2Client = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+        'https://developers.google.com/oauthplayground'
+      );
+      oauth2Client.setCredentials({
+        refresh_token: process.env.GOOGLE_REFRESH_TOKEN
+      });
+      drive = google.drive({ version: 'v3', auth: oauth2Client });
+      console.log('✅ Google Drive OAuth2 authenticated (Personal Drive quota active)');
+      return;
+    }
+
+    // 2. Fallback to Service Account
     let credentials = null;
     if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
       credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
@@ -79,7 +95,7 @@ function initGoogleDrive() {
       drive = google.drive({ version: 'v3', auth });
       console.log('✅ Google Drive Service Account authenticated');
     } else {
-      console.warn('⚠️ GOOGLE_SERVICE_ACCOUNT_JSON missing. Running in simulation mode.');
+      console.warn('⚠️ GOOGLE_SERVICE_ACCOUNT_JSON / OAuth2 credentials missing. Running in simulation mode.');
     }
   } catch (err) {
     console.error('❌ Google Drive Auth Error:', err.message);
