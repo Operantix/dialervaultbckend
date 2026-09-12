@@ -278,9 +278,11 @@ app.get('/api/backup/quota', async (req, res) => {
 
   res.json({
     email,
-    usedBytes: userQuota.usedBytes,
-    limitBytes: userQuota.isLifetime100GB ? LIFETIME_LIMIT : FREE_LIMIT,
-    isLifetime100GB: userQuota.isLifetime100GB
+    usedBytes: userQuota.usedBytes || 0,
+    limitBytes: userQuota.limitBytes || (userQuota.isLifetime100GB ? LIFETIME_LIMIT : FREE_LIMIT),
+    isLifetime100GB: !!userQuota.isLifetime100GB,
+    purchased_packs: userQuota.purchased_packs || (userQuota.isLifetime100GB ? 1 : 0),
+    total_gb: userQuota.total_gb || (userQuota.isLifetime100GB ? 100 : 1)
   });
 });
 
@@ -360,7 +362,7 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
       });
     }
 
-    const maxAllowed = userQuota.isLifetime100GB ? LIFETIME_LIMIT : FREE_LIMIT;
+    const maxAllowed = userQuota.limitBytes || (userQuota.isLifetime100GB ? LIFETIME_LIMIT : FREE_LIMIT);
     if (userQuota.usedBytes + bytes > maxAllowed) {
       return res.status(403).json({ error: 'Storage quota exceeded for your tier' });
     }
@@ -700,8 +702,10 @@ async function getActiveRazorpayConfig() {
     key_id: process.env.RAZORPAY_KEY_ID || '',
     key_secret: process.env.RAZORPAY_KEY_SECRET || '',
     currency: 'INR',
+    price_100gb: 10,
+    price_100gb_inr: 10,
     amount_in_paise: 1000,
-    plan_name: '100 GB Lifetime Cloud Vault',
+    plan_name: '100 GB Cloud Storage Pack',
     description: 'Permanent 100 GB High-Speed Encrypted Cloud Storage & VIP Disaster Recovery'
   };
 
@@ -710,9 +714,13 @@ async function getActiveRazorpayConfig() {
       const snap = await firebaseDb.ref('server_config/razorpay').once('value');
       if (snap.exists()) {
         const val = snap.val();
+        const priceInr = parseInt(val.price_100gb || val.price_100gb_inr || val.price || 10, 10);
         config = {
           ...config,
           ...val,
+          price_100gb: priceInr,
+          price_100gb_inr: priceInr,
+          amount_in_paise: val.amount_in_paise || (priceInr * 100),
           key_id: val.key_id || config.key_id,
           key_secret: val.key_secret || config.key_secret
         };
@@ -720,6 +728,11 @@ async function getActiveRazorpayConfig() {
     } catch (e) {
       console.warn('⚠️ Could not load Razorpay config from Firebase:', e.message);
     }
+  }
+
+  // Ensure amount_in_paise always accurately mirrors price_100gb in INR (1 ₹ = 100 paise)
+  if (config.price_100gb) {
+    config.amount_in_paise = config.price_100gb * 100;
   }
 
   return config;
@@ -734,8 +747,10 @@ app.get('/api/payment/config', async (req, res) => {
       enabled: config.enabled !== false,
       key_id: config.key_id,
       currency: config.currency || 'INR',
+      price_100gb: config.price_100gb || 10,
+      price_100gb_inr: config.price_100gb || 10,
       amount_in_paise: config.amount_in_paise || 1000,
-      plan_name: config.plan_name || '100 GB Lifetime Cloud Vault',
+      plan_name: config.plan_name || '100 GB Cloud Storage Pack',
       description: config.description || 'Permanent 100 GB Cloud Storage'
     });
   } catch (err) {
@@ -777,6 +792,7 @@ app.post('/api/payment/create-order', async (req, res) => {
       notes: {
         email: email.trim().toLowerCase(),
         plan: config.plan_name,
+        price_100gb: config.price_100gb,
         app: 'DialerVault'
       }
     });
@@ -788,6 +804,7 @@ app.post('/api/payment/create-order', async (req, res) => {
         email: email.trim().toLowerCase(),
         amount,
         currency,
+        price_100gb: config.price_100gb,
         status: 'created',
         receipt,
         created_at: new Date().toISOString()
@@ -799,6 +816,7 @@ app.post('/api/payment/create-order', async (req, res) => {
       order_id: order.id,
       amount: order.amount,
       currency: order.currency,
+      price_100gb: config.price_100gb,
       key_id: keyId,
       plan_name: config.plan_name,
       description: config.description
@@ -809,7 +827,7 @@ app.post('/api/payment/create-order', async (req, res) => {
   }
 });
 
-// 3. Verify Razorpay Payment Signature and Activate VIP 100 GB Tier
+// 3. Verify Razorpay Payment Signature and Cumulatively Extend +100 GB Storage
 app.post('/api/payment/verify', async (req, res) => {
   try {
     const { email, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
@@ -843,39 +861,70 @@ app.post('/api/payment/verify', async (req, res) => {
       signature: razorpay_signature,
       email: email.trim().toLowerCase(),
       amount: config.amount_in_paise || 1000,
+      price_100gb: config.price_100gb || 10,
       currency: config.currency || 'INR',
       plan: config.plan_name,
       verified_at: new Date().toISOString()
     };
 
+    const ONE_PACK_BYTES = 107374182400; // 100 GB in bytes
+    let newLimit = ONE_PACK_BYTES;
+    let newPacks = 1;
+    let totalGB = 100;
+
     if (firebaseDb) {
-      // Save payment under /payments/{payment_id}
+      // Save payment log under /payments/{payment_id}
       await firebaseDb.ref(`payments/${razorpay_payment_id}`).set(paymentRecord);
 
-      // Save payment under user record
-      await firebaseDb.ref(`users/${userKey}/payment`).set(paymentRecord);
+      // Save payment under user record history
+      await firebaseDb.ref(`users/${userKey}/payments/${razorpay_payment_id}`).set(paymentRecord);
+      await firebaseDb.ref(`users/${userKey}/last_payment`).set(paymentRecord);
 
-      // Update user quota to 100 GB Lifetime Tier
+      // Check current user quota to extend storage cumulatively
+      const quotaSnap = await firebaseDb.ref(`users/${userKey}/quota`).once('value');
+      if (quotaSnap.exists()) {
+        const qVal = quotaSnap.val();
+        if (qVal.isLifetime100GB && qVal.limitBytes) {
+          const currentLimit = parseInt(qVal.limitBytes, 10) || 0;
+          const currentPacks = parseInt(qVal.purchased_packs, 10) || 1;
+          newLimit = currentLimit + ONE_PACK_BYTES;
+          newPacks = currentPacks + 1;
+        }
+      }
+
+      totalGB = Math.round(newLimit / (1024 * 1024 * 1024));
+
+      // Update user quota to cumulative 100 GB tiers
       await firebaseDb.ref(`users/${userKey}/quota/isLifetime100GB`).set(true);
-      await firebaseDb.ref(`users/${userKey}/quota/limitBytes`).set(LIFETIME_LIMIT);
-      await firebaseDb.ref(`users/${userKey}/quota/upgraded_at`).set(new Date().toISOString());
+      await firebaseDb.ref(`users/${userKey}/quota/limitBytes`).set(newLimit);
+      await firebaseDb.ref(`users/${userKey}/quota/purchased_packs`).set(newPacks);
+      await firebaseDb.ref(`users/${userKey}/quota/total_gb`).set(totalGB);
+      await firebaseDb.ref(`users/${userKey}/quota/last_upgraded_at`).set(new Date().toISOString());
 
       // Update order status
       await firebaseDb.ref(`orders/${razorpay_order_id}/status`).set('paid');
       await firebaseDb.ref(`orders/${razorpay_order_id}/payment_id`).set(razorpay_payment_id);
+      await firebaseDb.ref(`orders/${razorpay_order_id}/allocated_limit`).set(newLimit);
     } else {
+      const prev = localDb.users[userKey]?.limitBytes || 0;
+      newLimit = prev > 0 ? (prev + ONE_PACK_BYTES) : ONE_PACK_BYTES;
+      totalGB = Math.round(newLimit / (1024 * 1024 * 1024));
       localDb.users[userKey] = {
         usedBytes: 0,
         isLifetime100GB: true,
-        limitBytes: LIFETIME_LIMIT
+        limitBytes: newLimit,
+        purchased_packs: newPacks,
+        total_gb: totalGB
       };
     }
 
     res.json({
       success: true,
-      message: 'Payment verified! 100 GB Lifetime VIP Plan successfully activated for ' + email,
+      message: `Payment verified! Successfully extended storage by +100 GB. Total Cloud Storage: ${totalGB} GB!`,
       isLifetime100GB: true,
-      limitBytes: LIFETIME_LIMIT
+      limitBytes: newLimit,
+      total_gb: totalGB,
+      purchased_packs: newPacks
     });
   } catch (err) {
     console.error('❌ Payment verification error:', err);
@@ -883,27 +932,47 @@ app.post('/api/payment/verify', async (req, res) => {
   }
 });
 
-// Legacy direct upgrade endpoint
+// Direct upgrade / extend endpoint
 app.post('/api/upgrade/activate', async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email required' });
 
     const key = cleanEmailKey(email);
-    let userQuota = { usedBytes: 0, isLifetime100GB: true, limitBytes: LIFETIME_LIMIT };
+    const ONE_PACK_BYTES = 107374182400; // 100 GB
+    let newLimit = ONE_PACK_BYTES;
+    let newPacks = 1;
+    let totalGB = 100;
 
     if (firebaseDb) {
-      await firebaseDb.ref(`users/${key}/quota/isLifetime100GB`).set(true);
-      await firebaseDb.ref(`users/${key}/quota/limitBytes`).set(LIFETIME_LIMIT);
-    } else {
-      localDb.users[key] = userQuota;
-    }
+      const quotaSnap = await firebaseDb.ref(`users/${key}/quota`).once('value');
+      if (quotaSnap.exists()) {
+        const qVal = quotaSnap.val();
+        if (qVal.isLifetime100GB && qVal.limitBytes) {
+          const currentLimit = parseInt(qVal.limitBytes, 10) || 0;
+          const currentPacks = parseInt(qVal.purchased_packs, 10) || 1;
+          newLimit = currentLimit + ONE_PACK_BYTES;
+          newPacks = currentPacks + 1;
+        }
+      }
+      totalGB = Math.round(newLimit / (1024 * 1024 * 1024));
 
-    res.json({
-      success: true,
-      message: '100 GB Lifetime Plan successfully activated for ' + email,
-      limitBytes: LIFETIME_LIMIT
-    });
+      await firebaseDb.ref(`users/${key}/quota/isLifetime100GB`).set(true);
+      await firebaseDb.ref(`users/${key}/quota/limitBytes`).set(newLimit);
+      await firebaseDb.ref(`users/${key}/quota/purchased_packs`).set(newPacks);
+      await firebaseDb.ref(`users/${key}/quota/total_gb`).set(totalGB);
+      await firebaseDb.ref(`users/${key}/quota/last_upgraded_at`).set(new Date().toISOString());
+
+      res.json({
+        success: true,
+        message: `Added +100 GB storage for ${email}. Total: ${totalGB} GB!`,
+        limitBytes: newLimit,
+        total_gb: totalGB
+      });
+    } else {
+      localDb.users[key] = { usedBytes: 0, isLifetime100GB: true, limitBytes: ONE_PACK_BYTES };
+      res.json({ success: true, limitBytes: ONE_PACK_BYTES, total_gb: 100 });
+    }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -25,14 +25,17 @@ async function setupRazorpayInFirebase(customKeyId, customKeySecret) {
 
   const keyId = customKeyId || process.env.RAZORPAY_KEY_ID || 'rzp_test_placeholder_key_id';
   const keySecret = customKeySecret || process.env.RAZORPAY_KEY_SECRET || 'placeholder_key_secret';
+  const priceInInr = parseInt(process.argv[4] || process.env.PRICE_100GB_INR || '10', 10);
 
   const razorpayConfig = {
     enabled: true,
     key_id: keyId,
     key_secret: keySecret,
     currency: 'INR',
-    amount_in_paise: 1000, // ₹10.00
-    plan_name: '100 GB Lifetime Cloud Vault',
+    price_100gb: priceInInr, // Editable in Firebase: Price in ₹ for 100 GB pack (e.g. 10, 19, 49)
+    price_100gb_inr: priceInInr,
+    amount_in_paise: priceInInr * 100, // Converted to paise (e.g. ₹10 = 1000 paise)
+    plan_name: '100 GB Cloud Storage Pack',
     description: 'Permanent 100 GB High-Speed Encrypted Cloud Storage & Disaster Recovery',
     updated_at: new Date().toISOString()
   };
