@@ -7,6 +7,7 @@ const stream = require('stream');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const Razorpay = require('razorpay');
 require('dotenv').config();
 
 const app = express();
@@ -692,7 +693,197 @@ app.get('/api/backup/download', async (req, res) => {
   }
 });
 
-// Activate 100 GB Lifetime Tier for ₹10
+// Helper: Dynamically fetch active Razorpay config from Firebase RTDB or .env
+async function getActiveRazorpayConfig() {
+  let config = {
+    enabled: true,
+    key_id: process.env.RAZORPAY_KEY_ID || '',
+    key_secret: process.env.RAZORPAY_KEY_SECRET || '',
+    currency: 'INR',
+    amount_in_paise: 1000,
+    plan_name: '100 GB Lifetime Cloud Vault',
+    description: 'Permanent 100 GB High-Speed Encrypted Cloud Storage & VIP Disaster Recovery'
+  };
+
+  if (firebaseDb) {
+    try {
+      const snap = await firebaseDb.ref('server_config/razorpay').once('value');
+      if (snap.exists()) {
+        const val = snap.val();
+        config = {
+          ...config,
+          ...val,
+          key_id: val.key_id || config.key_id,
+          key_secret: val.key_secret || config.key_secret
+        };
+      }
+    } catch (e) {
+      console.warn('⚠️ Could not load Razorpay config from Firebase:', e.message);
+    }
+  }
+
+  return config;
+}
+
+// 1. Get Public Razorpay Configuration for Android Client
+app.get('/api/payment/config', async (req, res) => {
+  try {
+    const config = await getActiveRazorpayConfig();
+    res.json({
+      success: true,
+      enabled: config.enabled !== false,
+      key_id: config.key_id,
+      currency: config.currency || 'INR',
+      amount_in_paise: config.amount_in_paise || 1000,
+      plan_name: config.plan_name || '100 GB Lifetime Cloud Vault',
+      description: config.description || 'Permanent 100 GB Cloud Storage'
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. Create Razorpay Order
+app.post('/api/payment/create-order', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+
+    const config = await getActiveRazorpayConfig();
+    const keyId = config.key_id;
+    const keySecret = config.key_secret;
+
+    if (!keyId || !keySecret || keyId === 'rzp_test_placeholder_key_id') {
+      console.warn('⚠️ Razorpay credentials not yet configured or placeholder in use.');
+      return res.status(503).json({
+        error: 'Razorpay API credentials have not been configured yet in Firebase or .env. Please update your key_id and key_secret.'
+      });
+    }
+
+    const rzp = new Razorpay({
+      key_id: keyId,
+      key_secret: keySecret
+    });
+
+    const amount = parseInt(config.amount_in_paise, 10) || 1000;
+    const currency = config.currency || 'INR';
+    const userKey = cleanEmailKey(email);
+    const receipt = `rcpt_${Date.now()}_${userKey.slice(0, 10)}`;
+
+    const order = await rzp.orders.create({
+      amount,
+      currency,
+      receipt,
+      notes: {
+        email: email.trim().toLowerCase(),
+        plan: config.plan_name,
+        app: 'DialerVault'
+      }
+    });
+
+    // Save created order in Firebase
+    if (firebaseDb) {
+      await firebaseDb.ref(`orders/${order.id}`).set({
+        order_id: order.id,
+        email: email.trim().toLowerCase(),
+        amount,
+        currency,
+        status: 'created',
+        receipt,
+        created_at: new Date().toISOString()
+      });
+    }
+
+    res.json({
+      success: true,
+      order_id: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      key_id: keyId,
+      plan_name: config.plan_name,
+      description: config.description
+    });
+  } catch (err) {
+    console.error('❌ Razorpay order creation error:', err);
+    res.status(500).json({ error: err.message || 'Failed to create Razorpay order' });
+  }
+});
+
+// 3. Verify Razorpay Payment Signature and Activate VIP 100 GB Tier
+app.post('/api/payment/verify', async (req, res) => {
+  try {
+    const { email, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    if (!email || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ error: 'Missing required payment verification parameters' });
+    }
+
+    const config = await getActiveRazorpayConfig();
+    const keySecret = config.key_secret;
+
+    if (!keySecret) {
+      return res.status(500).json({ error: 'Razorpay secret key not configured on server' });
+    }
+
+    // Razorpay signature validation: HMAC-SHA256(order_id + "|" + payment_id, secret)
+    const hmac = crypto.createHmac('sha256', keySecret);
+    hmac.update(`${razorpay_order_id}|${razorpay_payment_id}`);
+    const generatedSignature = hmac.digest('hex');
+
+    if (generatedSignature !== razorpay_signature) {
+      console.warn(`❌ Payment signature mismatch for order ${razorpay_order_id}`);
+      return res.status(400).json({ success: false, error: 'Payment signature verification failed' });
+    }
+
+    console.log(`✅ Razorpay payment verified successfully: Payment ID: ${razorpay_payment_id}, Order ID: ${razorpay_order_id} for ${email}`);
+
+    const userKey = cleanEmailKey(email);
+    const paymentRecord = {
+      order_id: razorpay_order_id,
+      payment_id: razorpay_payment_id,
+      signature: razorpay_signature,
+      email: email.trim().toLowerCase(),
+      amount: config.amount_in_paise || 1000,
+      currency: config.currency || 'INR',
+      plan: config.plan_name,
+      verified_at: new Date().toISOString()
+    };
+
+    if (firebaseDb) {
+      // Save payment under /payments/{payment_id}
+      await firebaseDb.ref(`payments/${razorpay_payment_id}`).set(paymentRecord);
+
+      // Save payment under user record
+      await firebaseDb.ref(`users/${userKey}/payment`).set(paymentRecord);
+
+      // Update user quota to 100 GB Lifetime Tier
+      await firebaseDb.ref(`users/${userKey}/quota/isLifetime100GB`).set(true);
+      await firebaseDb.ref(`users/${userKey}/quota/limitBytes`).set(LIFETIME_LIMIT);
+      await firebaseDb.ref(`users/${userKey}/quota/upgraded_at`).set(new Date().toISOString());
+
+      // Update order status
+      await firebaseDb.ref(`orders/${razorpay_order_id}/status`).set('paid');
+      await firebaseDb.ref(`orders/${razorpay_order_id}/payment_id`).set(razorpay_payment_id);
+    } else {
+      localDb.users[userKey] = {
+        usedBytes: 0,
+        isLifetime100GB: true,
+        limitBytes: LIFETIME_LIMIT
+      };
+    }
+
+    res.json({
+      success: true,
+      message: 'Payment verified! 100 GB Lifetime VIP Plan successfully activated for ' + email,
+      isLifetime100GB: true,
+      limitBytes: LIFETIME_LIMIT
+    });
+  } catch (err) {
+    console.error('❌ Payment verification error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Legacy direct upgrade endpoint
 app.post('/api/upgrade/activate', async (req, res) => {
   try {
     const { email } = req.body;
