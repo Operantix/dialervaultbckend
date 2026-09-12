@@ -50,10 +50,23 @@ function findLocalFile(email, itemId) {
 app.use(cors());
 app.use(express.json());
 
-// In-memory multer storage for incoming encrypted file chunks
+// Disk-based multer storage for high-speed streaming of large files (up to 500MB) without memory pressure
+const uploadTempDir = path.join(STORAGE_ROOT, 'temp_uploads');
+if (!fs.existsSync(uploadTempDir)) {
+  fs.mkdirSync(uploadTempDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadTempDir),
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    cb(null, `${file.fieldname}-${uniqueSuffix}.tmp`);
+  }
+});
+
 const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 100 * 1024 * 1024 } // 100MB per file chunk
+  storage: storage,
+  limits: { fileSize: 500 * 1024 * 1024 } // 500MB per file chunk
 });
 
 // 1. Initialize Google Drive API Client (Supports OAuth2 for Personal Drive or Service Account)
@@ -153,6 +166,7 @@ const LIFETIME_LIMIT = 107374182400; // 100 GB
 
 // Cache for created Drive folder IDs so we don't query Drive every upload
 const folderIdCache = new Map();
+const folderPromiseCache = new Map();
 
 // Helper: Sanitize email for folder and key names
 function cleanEmailKey(email) {
@@ -168,39 +182,51 @@ async function getOrCreateDriveFolder(parentFolderId, folderName) {
   if (folderIdCache.has(cacheKey)) {
     return folderIdCache.get(cacheKey);
   }
+  if (folderPromiseCache.has(cacheKey)) {
+    return await folderPromiseCache.get(cacheKey);
+  }
 
   if (!drive) return null;
 
-  try {
-    const query = `'${parentFolderId}' in parents and name = '${folderName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
-    const res = await drive.files.list({
-      q: query,
-      fields: 'files(id, name)',
-      spaces: 'drive'
-    });
+  const folderPromise = (async () => {
+    try {
+      const query = `'${parentFolderId}' in parents and name = '${folderName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+      const res = await drive.files.list({
+        q: query,
+        fields: 'files(id, name)',
+        spaces: 'drive'
+      });
 
-    if (res.data.files && res.data.files.length > 0) {
-      const folderId = res.data.files[0].id;
-      folderIdCache.set(cacheKey, folderId);
-      return folderId;
+      if (res.data.files && res.data.files.length > 0) {
+        const folderId = res.data.files[0].id;
+        folderIdCache.set(cacheKey, folderId);
+        return folderId;
+      }
+
+      // Create new folder
+      const createRes = await drive.files.create({
+        requestBody: {
+          name: folderName,
+          mimeType: 'application/vnd.google-apps.folder',
+          parents: [parentFolderId]
+        },
+        fields: 'id'
+      });
+
+      const newId = createRes.data.id;
+      folderIdCache.set(cacheKey, newId);
+      return newId;
+    } catch (err) {
+      console.error(`Error managing folder ${folderName}:`, err.message);
+      return null;
     }
+  })();
 
-    // Create new folder
-    const createRes = await drive.files.create({
-      requestBody: {
-        name: folderName,
-        mimeType: 'application/vnd.google-apps.folder',
-        parents: [parentFolderId]
-      },
-      fields: 'id'
-    });
-
-    const newId = createRes.data.id;
-    folderIdCache.set(cacheKey, newId);
-    return newId;
-  } catch (err) {
-    console.error(`Error managing folder ${folderName}:`, err.message);
-    return null;
+  folderPromiseCache.set(cacheKey, folderPromise);
+  try {
+    return await folderPromise;
+  } finally {
+    folderPromiseCache.delete(cacheKey);
   }
 }
 
@@ -301,11 +327,11 @@ function cleanFileNameKey(name) {
 
 // Upload encrypted file chunk
 app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
+  const uploadedFilePath = req.file?.path;
   try {
     const { email, itemId, fileName, fileSize, category } = req.body;
-    const fileBuffer = req.file?.buffer;
 
-    if (!email || !itemId || !fileBuffer) {
+    if (!email || !itemId || (!uploadedFilePath && !req.file?.buffer)) {
       return res.status(400).json({ error: 'Missing email, itemId or file data' });
     }
 
@@ -314,12 +340,14 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
     const safeCategory = category && category.trim() ? category.trim() : 'General';
     const safeFileName = fileName || `file_${itemId}`;
     const fileKey = cleanFileNameKey(safeFileName);
-    const bytes = parseInt(fileSize, 10) || fileBuffer.length;
+    const bytes = parseInt(fileSize, 10) || req.file?.size || (req.file?.buffer ? req.file.buffer.length : 0);
 
     // Check user quota in Firebase / localDb
     let userQuota = { usedBytes: 0, isLifetime100GB: false };
     let alreadySynced = false;
     let existingDriveId = null;
+    let existingDriveLink = null;
+    let existingDownloadLink = null;
 
     if (firebaseDb) {
       const snap = await firebaseDb.ref(`users/${userName}/quota`).once('value');
@@ -328,37 +356,53 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
       // Check 1: Does this file name already exist in users/<username>/<category>/<fileName>?
       const byNameSnap = await firebaseDb.ref(`users/${userName}/${safeCategory}/${fileKey}`).once('value');
       if (byNameSnap.exists()) {
-        alreadySynced = true;
-        existingDriveId = byNameSnap.val().driveFileId;
+        const val = byNameSnap.val();
+        if (val.backedUpToDrive && val.driveFileId && val.driveFileId !== 'local_vault_storage') {
+          alreadySynced = true;
+          existingDriveId = val.driveFileId;
+          existingDriveLink = val.driveLink || val.webViewLink;
+          existingDownloadLink = val.downloadLink;
+        }
       }
 
       // Check 2: Does this itemId already exist in users/<username>/files/<itemId>?
       if (!alreadySynced) {
         const byIdSnap = await firebaseDb.ref(`users/${userName}/files/${itemId}`).once('value');
         if (byIdSnap.exists()) {
-          alreadySynced = true;
-          existingDriveId = byIdSnap.val().driveFileId;
+          const val = byIdSnap.val();
+          if (val.backedUpToDrive && val.driveFileId && val.driveFileId !== 'local_vault_storage') {
+            alreadySynced = true;
+            existingDriveId = val.driveFileId;
+            existingDriveLink = val.driveLink || val.webViewLink;
+            existingDownloadLink = val.downloadLink;
+          }
         }
       }
     } else {
       userQuota = localDb.users[userName] || userQuota;
-      if (localDb.files[userName] && (localDb.files[userName][itemId] || localDb.files[userName][fileKey])) {
+      if (localDb.files[userName] && localDb.files[userName][itemId] && localDb.files[userName][itemId].backedUpToDrive) {
         alreadySynced = true;
+        existingDriveId = localDb.files[userName][itemId].driveFileId;
+        existingDriveLink = localDb.files[userName][itemId].driveLink;
+        existingDownloadLink = localDb.files[userName][itemId].downloadLink;
       }
     }
 
-    // If ALREADY SYNCED in Firebase, SKIP Google Drive upload entirely!
-    if (alreadySynced) {
-      console.log(`ℹ️ [Firebase Sync Skip] '${safeFileName}' (${itemId}) is already synced in Firebase for user '${userName}' in '${safeCategory}'. Skipping Drive upload.`);
+    // If ALREADY SYNCED in Google Drive & Firebase, return confirmed links
+    if (alreadySynced && existingDriveId) {
+      console.log(`ℹ️ [Firebase Sync Skip] '${safeFileName}' (${itemId}) is already backed up to Drive (ID: ${existingDriveId}) and recorded in Firebase. Skipping.`);
       return res.json({
         success: true,
         itemId,
         fileName: safeFileName,
-        driveFileId: existingDriveId || 'existing_cloud_file',
+        driveFileId: existingDriveId,
+        driveLink: existingDriveLink || `https://drive.google.com/file/d/${existingDriveId}/view`,
+        downloadLink: existingDownloadLink || `https://drive.google.com/uc?id=${existingDriveId}&export=download`,
         category: safeCategory,
         alreadySynced: true,
         isDuplicate: true,
-        message: `File '${safeFileName}' is already backed up. Duplicate skipped.`
+        backedUpToDrive: true,
+        message: `File '${safeFileName}' is already backed up to Drive and synced in Firebase.`
       });
     }
 
@@ -367,85 +411,155 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
       return res.status(403).json({ error: 'Storage quota exceeded for your tier' });
     }
 
-    let driveFileId = null;
-
-    // 1. Ensure file is saved locally in server storage under username/category
+    // 1. Ensure file is saved locally in server storage under username/category as fallback/staging
     try {
       const localDir = getLocalUserPath(email, safeCategory);
       const localFilePath = path.join(localDir, `${itemId}.enc`);
       if (!fs.existsSync(localFilePath)) {
-        fs.writeFileSync(localFilePath, fileBuffer);
+        if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
+          fs.copyFileSync(uploadedFilePath, localFilePath);
+        } else if (req.file?.buffer) {
+          fs.writeFileSync(localFilePath, req.file.buffer);
+        }
       }
     } catch (saveErr) {
       console.error('Local save error:', saveErr.message);
     }
 
-    // 2. Google Drive check & upload (double-checks Drive folder so Drive never has duplicate)
-    if (drive) {
-      try {
-        const targetFolderId = await resolveUserCategoryFolder(email, safeCategory);
-
-        // Check if file with same itemId or fileName already exists in Drive folder
-        const existingQuery = `'${targetFolderId}' in parents and name = '${itemId}.enc' and trashed = false`;
-        const existingRes = await drive.files.list({
-          q: existingQuery,
-          fields: 'files(id, name, size)',
-          spaces: 'drive',
-          supportsAllDrives: true,
-          includeItemsFromAllDrives: true
-        });
-
-        if (existingRes.data.files && existingRes.data.files.length > 0) {
-          driveFileId = existingRes.data.files[0].id;
-          console.log(`ℹ️ [Drive Duplicate Skip] '${itemId}.enc' already exists in Drive folder (ID: ${driveFileId}).`);
-        } else {
-          // File does not exist yet -> Upload once
-          const bufferStream = new stream.PassThrough();
-          bufferStream.end(fileBuffer);
-
-          const driveRes = await drive.files.create({
-            requestBody: {
-              name: `${itemId}.enc`,
-              mimeType: 'application/octet-stream',
-              parents: targetFolderId ? [targetFolderId] : undefined
-            },
-            media: {
-              mimeType: 'application/octet-stream',
-              body: bufferStream
-            },
-            fields: 'id',
-            supportsAllDrives: true
-          });
-
-          driveFileId = driveRes.data.id;
-          console.log(`✅ [Uploaded to Drive] '${safeFileName}' (${itemId}.enc) -> ID: ${driveFileId}`);
-        }
-      } catch (driveErr) {
-        console.warn(`[Drive Notice] Cloud drive write skipped (${driveErr.message}). File securely held in Central Vault storage.`);
-      }
+    // 2. CRITICAL: Upload to Google Drive FIRST.
+    // Photos, videos, documents, and all other details will ONLY be saved to Firebase
+    // if Google Drive backup is 100% successful!
+    if (!drive) {
+      initGoogleDrive();
     }
 
-    // 3. Store in Firebase in structured path: users/<username>/<category>/<fileName> and users/<username>/files/<itemId>
+    if (!drive) {
+      return res.status(502).json({
+        success: false,
+        error: 'Google Drive is not connected or initialized. File details cannot be saved to Firebase without successful Google Drive backup.'
+      });
+    }
+
+    let driveFileId = null;
+    let driveWebViewLink = null;
+    let driveDownloadLink = null;
+
+    try {
+      const targetFolderId = await resolveUserCategoryFolder(email, safeCategory);
+
+      // Check if file with same itemId or fileName already exists in Drive folder
+      const existingQuery = `'${targetFolderId}' in parents and name = '${itemId}.enc' and trashed = false`;
+      const existingRes = await drive.files.list({
+        q: existingQuery,
+        fields: 'files(id, name, size, webViewLink, webContentLink)',
+        spaces: 'drive',
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true
+      });
+
+      if (existingRes.data.files && existingRes.data.files.length > 0) {
+        const fileObj = existingRes.data.files[0];
+        driveFileId = fileObj.id;
+        driveWebViewLink = fileObj.webViewLink || `https://drive.google.com/file/d/${driveFileId}/view?usp=drivesdk`;
+        driveDownloadLink = fileObj.webContentLink || `https://drive.google.com/uc?id=${driveFileId}&export=download`;
+        console.log(`ℹ️ [Drive Found] '${itemId}.enc' already present in Drive (ID: ${driveFileId}).`);
+      } else {
+        // High-speed direct streaming to Google Drive
+        let mediaBody;
+        if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
+          mediaBody = fs.createReadStream(uploadedFilePath);
+        } else if (req.file?.buffer) {
+          const bufferStream = new stream.PassThrough();
+          bufferStream.end(req.file.buffer);
+          mediaBody = bufferStream;
+        }
+
+        const driveRes = await drive.files.create({
+          requestBody: {
+            name: `${itemId}.enc`,
+            mimeType: 'application/octet-stream',
+            parents: targetFolderId ? [targetFolderId] : undefined,
+            description: `DialerVault Backup: ${safeFileName} (${safeCategory})`
+          },
+          media: {
+            mimeType: 'application/octet-stream',
+            body: mediaBody
+          },
+          fields: 'id, name, webViewLink, webContentLink, size, mimeType',
+          supportsAllDrives: true
+        });
+
+        driveFileId = driveRes.data.id;
+        driveWebViewLink = driveRes.data.webViewLink || `https://drive.google.com/file/d/${driveFileId}/view?usp=drivesdk`;
+        driveDownloadLink = driveRes.data.webContentLink || `https://drive.google.com/uc?id=${driveFileId}&export=download`;
+
+        // Grant read permission asynchronously in background (eliminates blocking latency)
+        drive.permissions.create({
+          fileId: driveFileId,
+          requestBody: {
+            role: 'reader',
+            type: 'anyone'
+          },
+          supportsAllDrives: true
+        }).catch((_permErr) => {});
+
+        console.log(`✅ [Uploaded to Drive] '${safeFileName}' (${itemId}.enc) -> ID: ${driveFileId}, Link: ${driveWebViewLink}`);
+      }
+    } catch (driveErr) {
+      console.error(`❌ [Google Drive Backup Failed] '${safeFileName}':`, driveErr.message);
+      return res.status(502).json({
+        success: false,
+        error: `Google Drive backup failed (${driveErr.message}). Details were NOT saved to Firebase because Drive backup is required first.`
+      });
+    }
+
+    if (!driveFileId) {
+      return res.status(502).json({
+        success: false,
+        error: 'Google Drive failed to return a valid File ID. Not saved to Firebase.'
+      });
+    }
+
+    // 3. NOW AND ONLY NOW: Save in Firebase Realtime Database
+    // Store complete file details, Drive links, category, and metadata!
+    const effectiveDriveLink = driveWebViewLink || `https://drive.google.com/file/d/${driveFileId}/view?usp=drivesdk`;
+    const effectiveDownloadLink = driveDownloadLink || `https://drive.google.com/uc?id=${driveFileId}&export=download`;
+
     const fileMetadata = {
       itemId,
       fileName: safeFileName,
       category: safeCategory,
       fileSizeBytes: bytes,
-      driveFileId: driveFileId || 'local_vault_storage',
+      driveFileId,
+      driveLink: effectiveDriveLink,
+      webViewLink: effectiveDriveLink,
+      downloadLink: effectiveDownloadLink,
+      backedUpToDrive: true,
+      email: email.trim().toLowerCase(),
       uploadedAt: Date.now()
     };
 
     userQuota.usedBytes += bytes;
 
     if (firebaseDb) {
-      // 1) By Category and FileName
-      await firebaseDb.ref(`users/${userName}/${safeCategory}/${fileKey}`).set(fileMetadata);
-      // 2) By ItemId for fast ID lookup
-      await firebaseDb.ref(`users/${userName}/files/${itemId}`).set(fileMetadata);
-      // 3) Quota tracking
-      await firebaseDb.ref(`users/${userName}/quota`).set(userQuota);
-      // Also write legacy key for backwards compatibility
-      await firebaseDb.ref(`users/${key}/quota`).set(userQuota);
+      // Atomic multi-path update in a single network round-trip
+      const updates = {};
+      updates[`users/${userName}/${safeCategory}/${fileKey}`] = fileMetadata;
+      updates[`users/${userName}/files/${itemId}`] = fileMetadata;
+      updates[`users/${userName}/links/${itemId}`] = {
+        itemId,
+        fileName: safeFileName,
+        category: safeCategory,
+        driveFileId,
+        driveLink: effectiveDriveLink,
+        downloadLink: effectiveDownloadLink,
+        uploadedAt: fileMetadata.uploadedAt
+      };
+      updates[`users/${userName}/quota`] = userQuota;
+      updates[`users/${key}/quota`] = userQuota;
+      updates[`users/${key}/files/${itemId}`] = fileMetadata;
+
+      await firebaseDb.ref().update(updates);
     } else {
       if (!localDb.files[userName]) localDb.files[userName] = {};
       localDb.files[userName][itemId] = fileMetadata;
@@ -457,23 +571,35 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
       success: true,
       itemId,
       fileName: safeFileName,
-      driveFileId: driveFileId || 'local_vault_storage',
+      driveFileId,
+      driveLink: effectiveDriveLink,
+      webViewLink: effectiveDriveLink,
+      downloadLink: effectiveDownloadLink,
       category: safeCategory,
+      backedUpToDrive: true,
       usedBytes: userQuota.usedBytes,
       alreadySynced: false,
-      message: `Successfully uploaded '${safeFileName}' to Cloud!`
+      message: `Successfully backed up '${safeFileName}' to Google Drive and recorded links in Firebase!`
     });
   } catch (err) {
     console.error('Upload error:', err);
     res.status(500).json({ error: err.message });
+  } finally {
+    // Clean up temporary upload file
+    if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
+      try { fs.unlinkSync(uploadedFilePath); } catch (_) {}
+    }
   }
 });
 
 // Upload Vault Manifest (vault_index.json) - DELETES old copy and replaces fresh every time!
 app.post('/api/backup/manifest', upload.single('manifest'), async (req, res) => {
+  const manifestFilePath = req.file?.path;
   try {
     const { email } = req.body;
-    const manifestBuffer = req.file?.buffer;
+    const manifestBuffer = manifestFilePath && fs.existsSync(manifestFilePath)
+      ? fs.readFileSync(manifestFilePath)
+      : req.file?.buffer;
 
     if (!email || !manifestBuffer) {
       return res.status(400).json({ error: 'Missing email or manifest' });
@@ -539,10 +665,18 @@ app.post('/api/backup/manifest', upload.single('manifest'), async (req, res) => 
             mimeType: 'application/json',
             body: bufferStream
           },
-          fields: 'id',
+          fields: 'id, name, webViewLink, webContentLink',
           supportsAllDrives: true
         });
-        console.log(`✅ [Fresh Manifest Created] New vault_index.json saved in Google Drive (ID: ${createRes.data.id}).`);
+        const manifestDriveId = createRes.data.id;
+        const manifestDriveLink = createRes.data.webViewLink || `https://drive.google.com/file/d/${manifestDriveId}/view`;
+        console.log(`✅ [Fresh Manifest Created] New vault_index.json saved in Google Drive (ID: ${manifestDriveId}, Link: ${manifestDriveLink}).`);
+
+        if (firebaseDb) {
+          await firebaseDb.ref(`users/${userName}/manifest_drive_link`).set(manifestDriveLink);
+          await firebaseDb.ref(`users/${userName}/manifest_drive_id`).set(manifestDriveId);
+          await firebaseDb.ref(`users/${key}/manifest_drive_link`).set(manifestDriveLink);
+        }
       } catch (dErr) {
         console.warn(`[Drive Notice] Manifest drive write skipped: ${dErr.message}`);
       }
@@ -555,7 +689,61 @@ app.post('/api/backup/manifest', upload.single('manifest'), async (req, res) => 
       await firebaseDb.ref(`users/${key}/manifest`).set(manifestStr);
     }
 
-    res.json({ success: true, message: 'Manifest cleanly replaced and backed up!' });
+    res.json({ success: true, message: 'Manifest cleanly replaced and backed up with Drive verification!' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    if (manifestFilePath && fs.existsSync(manifestFilePath)) {
+      try { fs.unlinkSync(manifestFilePath); } catch (_) {}
+    }
+  }
+});
+
+// Endpoint to fetch all backed-up Google Drive links stored in Firebase
+app.get('/api/backup/drive-links', async (req, res) => {
+  try {
+    const email = req.query.email;
+    if (!email) return res.status(400).json({ error: 'Email parameter required' });
+
+    const userName = getUserName(email);
+    const key = cleanEmailKey(email);
+    let filesObj = {};
+
+    if (firebaseDb) {
+      const filesSnap = await firebaseDb.ref(`users/${userName}/files`).once('value');
+      if (filesSnap.exists()) {
+        filesObj = filesSnap.val();
+      } else {
+        const legacySnap = await firebaseDb.ref(`users/${key}/files`).once('value');
+        if (legacySnap.exists()) filesObj = legacySnap.val();
+      }
+    } else {
+      filesObj = localDb.files[userName] || {};
+    }
+
+    const driveLinks = [];
+    for (const [id, meta] of Object.entries(filesObj)) {
+      if (meta && (meta.backedUpToDrive || (meta.driveFileId && meta.driveFileId !== 'local_vault_storage'))) {
+        driveLinks.push({
+          itemId: meta.itemId || id,
+          fileName: meta.fileName,
+          category: meta.category,
+          driveFileId: meta.driveFileId,
+          driveLink: meta.driveLink || meta.webViewLink || `https://drive.google.com/file/d/${meta.driveFileId}/view`,
+          downloadLink: meta.downloadLink || `https://drive.google.com/uc?id=${meta.driveFileId}&export=download`,
+          fileSizeBytes: meta.fileSizeBytes || 0,
+          uploadedAt: meta.uploadedAt
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      email,
+      userName,
+      count: driveLinks.length,
+      links: driveLinks
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -602,9 +790,14 @@ app.get('/api/backup/manifest', async (req, res) => {
 
     // 1. Check Firebase first for fast instant download
     if (firebaseDb) {
-      const snap = await firebaseDb.ref(`users/${key}/manifest`).once('value');
+      const userName = getUserName(email);
+      let snap = await firebaseDb.ref(`users/${userName}/manifest`).once('value');
+      if (!snap.exists()) {
+        snap = await firebaseDb.ref(`users/${key}/manifest`).once('value');
+      }
       if (snap.exists()) {
-        return res.type('json').send(snap.val());
+        const val = snap.val();
+        return res.type('json').send(typeof val === 'string' ? val : JSON.stringify(val));
       }
     }
 
@@ -656,7 +849,11 @@ app.get('/api/backup/download', async (req, res) => {
 
     // 2. Look up driveFileId from Firebase metadata
     if (firebaseDb) {
-      const snap = await firebaseDb.ref(`users/${key}/files/${itemId}`).once('value');
+      const userName = getUserName(email);
+      let snap = await firebaseDb.ref(`users/${userName}/files/${itemId}`).once('value');
+      if (!snap.exists()) {
+        snap = await firebaseDb.ref(`users/${key}/files/${itemId}`).once('value');
+      }
       if (snap.exists()) {
         driveFileId = snap.val().driveFileId;
       }
