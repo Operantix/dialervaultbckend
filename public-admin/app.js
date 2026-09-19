@@ -2,8 +2,9 @@
 let allUsers = [];
 let currentUserKey = null;
 let currentFiles = [];
-let activeCategory = 'all';
-let recoveryMode = 'decrypted'; // 'decrypted' | 'encrypted'
+let activeBox = 'all'; // 'all' | 'Photos' | 'Videos' | 'Audio' | 'Other'
+let activeSection = 'decrypted'; // 'decrypted' | 'encrypted'
+let downloadedFileIds = new Set(); // Track downloaded & decrypted files
 
 const serverUrlInput = document.getElementById('serverUrl');
 const adminKeyInput = document.getElementById('adminKey');
@@ -17,30 +18,47 @@ const statTotalFiles = document.getElementById('statTotalFiles');
 const statTotalStorage = document.getElementById('statTotalStorage');
 const statUnusual = document.getElementById('statUnusual');
 
-const usersTableBody = document.getElementById('usersTableBody');
-const userFilesModal = document.getElementById('userFilesModal');
-const btnCloseModal = document.getElementById('btnCloseModal');
-const modalUserName = document.getElementById('modalUserName');
-const modalUserEmail = document.getElementById('modalUserEmail');
-const btnRecoverManifest = document.getElementById('btnRecoverManifest');
-const btnRecoverAll = document.getElementById('btnRecoverAll');
-const recoverAllCount = document.getElementById('recoverAllCount');
-const filesTableBody = document.getElementById('filesTableBody');
+// Views
+const usersListView = document.querySelector('.content-section');
+const vaultDetailView = document.getElementById('vaultDetailView');
+const btnBackToUsers = document.getElementById('btnBackToUsers');
 
-const btnModeDecrypted = document.getElementById('btnModeDecrypted');
-const btnModeEncrypted = document.getElementById('btnModeEncrypted');
+// Header in Detail
+const detailUserName = document.getElementById('detailUserName');
+const detailUserEmail = document.getElementById('detailUserEmail');
+const detailTotalFilesPill = document.getElementById('detailTotalFilesPill');
+const detailTotalSizePill = document.getElementById('detailTotalSizePill');
+const btnRecoverManifest = document.getElementById('btnRecoverManifest');
+
+// Section Tabs
+const tabBtnDecrypted = document.getElementById('tabBtnDecrypted');
+const tabBtnEncrypted = document.getElementById('tabBtnEncrypted');
+const sectionDecrypted = document.getElementById('sectionDecrypted');
+const sectionEncrypted = document.getElementById('sectionEncrypted');
+
+// Recover All Buttons
+const btnRecoverAllDecrypted = document.getElementById('btnRecoverAllDecrypted');
+const btnRecoverAllEncrypted = document.getElementById('btnRecoverAllEncrypted');
+const decryptedRecoverCount = document.getElementById('decryptedRecoverCount');
+const encryptedRecoverCount = document.getElementById('encryptedRecoverCount');
+
+// Tables
+const usersTableBody = document.getElementById('usersTableBody');
+const decryptedFilesTableBody = document.getElementById('decryptedFilesTableBody');
+const encryptedFilesTableBody = document.getElementById('encryptedFilesTableBody');
+
+// Progress Bar
 const progressContainer = document.getElementById('downloadProgressBarContainer');
 const progressStatusText = document.getElementById('progressStatusText');
 const progressPercentText = document.getElementById('progressPercentText');
 const progressBarFill = document.getElementById('progressBarFill');
 
-// Folder counts
-const fCountAll = document.getElementById('fCountAll');
-const fCountPhotos = document.getElementById('fCountPhotos');
-const fCountVideos = document.getElementById('fCountVideos');
-const fCountAudio = document.getElementById('fCountAudio');
-const fCountDocs = document.getElementById('fCountDocs');
-const fCountArchives = document.getElementById('fCountArchives');
+// Box Counts
+const boxCountAll = document.getElementById('boxCountAll');
+const boxCountImages = document.getElementById('boxCountImages');
+const boxCountVideos = document.getElementById('boxCountVideos');
+const boxCountMusic = document.getElementById('boxCountMusic');
+const boxCountOther = document.getElementById('boxCountOther');
 
 // Load saved config
 const savedServer = localStorage.getItem('dv_admin_server') || 'https://dialervaultbckend-production.up.railway.app';
@@ -57,38 +75,39 @@ btnSaveConfig.addEventListener('click', () => {
 btnRefresh.addEventListener('click', fetchUsers);
 userSearchInput.addEventListener('input', renderUsers);
 
-btnCloseModal.addEventListener('click', () => {
-  userFilesModal.classList.add('hidden');
+// Back to Users List
+btnBackToUsers.addEventListener('click', () => {
+  vaultDetailView.classList.add('hidden');
+  usersListView.classList.remove('hidden');
+  progressContainer.classList.add('hidden');
 });
 
-window.addEventListener('click', (e) => {
-  if (e.target === userFilesModal) {
-    userFilesModal.classList.add('hidden');
-  }
+// Section Tabs
+tabBtnDecrypted.addEventListener('click', () => {
+  activeSection = 'decrypted';
+  tabBtnDecrypted.classList.add('active');
+  tabBtnEncrypted.classList.remove('active');
+  sectionDecrypted.classList.remove('hidden');
+  sectionEncrypted.classList.add('hidden');
+  renderDecryptedSection();
 });
 
-// Mode Toggles
-btnModeDecrypted.addEventListener('click', () => {
-  recoveryMode = 'decrypted';
-  btnModeDecrypted.classList.add('active');
-  btnModeEncrypted.classList.remove('active');
-  renderFilesTable();
+tabBtnEncrypted.addEventListener('click', () => {
+  activeSection = 'encrypted';
+  tabBtnEncrypted.classList.add('active');
+  tabBtnDecrypted.classList.remove('active');
+  sectionEncrypted.classList.remove('hidden');
+  sectionDecrypted.classList.add('hidden');
+  renderEncryptedSection();
 });
 
-btnModeEncrypted.addEventListener('click', () => {
-  recoveryMode = 'encrypted';
-  btnModeEncrypted.classList.add('active');
-  btnModeDecrypted.classList.remove('active');
-  renderFilesTable();
-});
-
-// Category Folder Clicks
-document.querySelectorAll('.folder-card').forEach(card => {
-  card.addEventListener('click', () => {
-    document.querySelectorAll('.folder-card').forEach(c => c.classList.remove('active'));
-    card.classList.add('active');
-    activeCategory = card.getAttribute('data-category');
-    renderFilesTable();
+// Box selection
+document.querySelectorAll('.vault-box').forEach(box => {
+  box.addEventListener('click', () => {
+    document.querySelectorAll('.vault-box').forEach(b => b.classList.remove('active'));
+    box.classList.add('active');
+    activeBox = box.getAttribute('data-box');
+    renderDecryptedSection();
   });
 });
 
@@ -100,37 +119,44 @@ btnRecoverManifest.addEventListener('click', () => {
   triggerDownload(downloadUrl, `${currentUserKey}_vault_index.json`);
 });
 
-// Recover All
-btnRecoverAll.addEventListener('click', async () => {
-  const filesToRecover = getFilteredFiles();
-  if (filesToRecover.length === 0) return;
+// Recover All Decrypted
+btnRecoverAllDecrypted.addEventListener('click', () => {
+  const files = getFilteredDecryptedFiles();
+  recoverBatch(files, 'decrypted');
+});
+
+// Recover All Encrypted
+btnRecoverAllEncrypted.addEventListener('click', () => {
+  recoverBatch(currentFiles, 'encrypted');
+});
+
+async function recoverBatch(files, mode) {
+  if (!files || files.length === 0) return;
 
   progressContainer.classList.remove('hidden');
-  btnRecoverAll.disabled = true;
-
   const baseUrl = serverUrlInput.value.trim().replace(/\/$/, '');
   const key = adminKeyInput.value.trim();
 
-  for (let i = 0; i < filesToRecover.length; i++) {
-    const file = filesToRecover[i];
-    const pct = Math.round(((i + 1) / filesToRecover.length) * 100);
-    progressStatusText.textContent = `Recovering ${i + 1}/${filesToRecover.length}: ${file.fileName || file.itemId} (${recoveryMode})...`;
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    const pct = Math.round(((i + 1) / files.length) * 100);
+    progressStatusText.textContent = `Recovering ${i + 1}/${files.length}: ${file.fileName || file.itemId} (${mode})...`;
     progressPercentText.textContent = `${pct}%`;
     progressBarFill.style.width = `${pct}%`;
 
-    const downloadUrl = `${baseUrl}/api/admin/user/${encodeURIComponent(currentUserKey)}/recover/${encodeURIComponent(file.itemId)}?mode=${recoveryMode}&adminKey=${encodeURIComponent(key)}`;
-    triggerDownload(downloadUrl, recoveryMode === 'encrypted' ? `${file.itemId}.enc` : (file.fileName || `${file.itemId}.bin`));
-    
-    // Short delay to allow browser to schedule downloads cleanly
+    const downloadUrl = `${baseUrl}/api/admin/user/${encodeURIComponent(currentUserKey)}/recover/${encodeURIComponent(file.itemId)}?mode=${mode}&adminKey=${encodeURIComponent(key)}`;
+    triggerDownload(downloadUrl, mode === 'encrypted' ? `${file.itemId}.enc` : (file.fileName || `${file.itemId}.bin`));
+    downloadedFileIds.add(file.itemId);
+
     await new Promise(r => setTimeout(r, 600));
   }
 
-  progressStatusText.textContent = `✅ Successfully recovered all ${filesToRecover.length} files (${recoveryMode})!`;
+  progressStatusText.textContent = `✅ Successfully recovered all ${files.length} files (${mode})!`;
+  if (mode === 'decrypted') renderDecryptedSection();
   setTimeout(() => {
     progressContainer.classList.add('hidden');
-    btnRecoverAll.disabled = false;
   }, 4000);
-});
+}
 
 function triggerDownload(url, filename) {
   const a = document.createElement('a');
@@ -167,9 +193,7 @@ async function fetchUsers() {
       headers: { 'x-admin-key': key }
     });
 
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
 
     const data = await res.json();
     allUsers = data.users || [];
@@ -228,8 +252,8 @@ function renderUsers() {
         <td>${u.isLifetime100GB ? '⭐️ 100 GB Lifetime' : 'Free Tier (1 GB)'}</td>
         <td>${formatDate(u.lastBackupTime)}</td>
         <td>
-          <button class="btn-view-files" onclick="openUserVault('${escapeHtml(u.userKey)}', '${escapeHtml(u.email)}')">
-            Explore Vault &amp; Recover
+          <button class="btn-view-files" onclick="openFullUserVault('${escapeHtml(u.userKey)}', '${escapeHtml(u.email)}')">
+            Open Vault Page &rarr;
           </button>
         </td>
       </tr>
@@ -237,18 +261,32 @@ function renderUsers() {
   }).join('');
 }
 
-window.openUserVault = async function(userKey, email) {
+// Open Full User Vault Page
+window.openFullUserVault = async function(userKey, email) {
   currentUserKey = userKey;
-  activeCategory = 'all';
-  document.querySelectorAll('.folder-card').forEach(c => c.classList.remove('active'));
-  document.querySelector('.folder-card[data-category="all"]').classList.add('active');
+  activeBox = 'all';
+  activeSection = 'decrypted';
+  downloadedFileIds.clear();
 
-  modalUserName.textContent = `Vault: ${userKey}`;
-  modalUserEmail.textContent = email || userKey;
-  userFilesModal.classList.remove('hidden');
+  document.querySelectorAll('.vault-box').forEach(b => b.classList.remove('active'));
+  document.querySelector('.vault-box[data-box="all"]').classList.add('active');
+
+  tabBtnDecrypted.classList.add('active');
+  tabBtnEncrypted.classList.remove('active');
+  sectionDecrypted.classList.remove('hidden');
+  sectionEncrypted.classList.add('hidden');
   progressContainer.classList.add('hidden');
 
-  filesTableBody.innerHTML = `<tr><td colspan="5" class="loading-cell">Loading vault files from Cloudflare R2 &amp; Firebase...</td></tr>`;
+  detailUserName.textContent = `Vault: ${userKey}`;
+  detailUserEmail.textContent = email || userKey;
+
+  // Switch views
+  usersListView.classList.add('hidden');
+  vaultDetailView.classList.remove('hidden');
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+
+  decryptedFilesTableBody.innerHTML = `<tr><td colspan="6" class="loading-cell">Loading files from database &amp; Cloudflare R2...</td></tr>`;
+  encryptedFilesTableBody.innerHTML = `<tr><td colspan="6" class="loading-cell">Loading encrypted files...</td></tr>`;
 
   const baseUrl = serverUrlInput.value.trim().replace(/\/$/, '');
   const key = adminKeyInput.value.trim();
@@ -260,69 +298,105 @@ window.openUserVault = async function(userKey, email) {
     const data = await res.json();
     currentFiles = data.files || [];
 
-    updateFolderCounts();
-    renderFilesTable();
+    const totalBytes = currentFiles.reduce((sum, f) => sum + (f.fileSizeBytes || 0), 0);
+    detailTotalFilesPill.textContent = `${currentFiles.length} files`;
+    detailTotalSizePill.textContent = formatBytes(totalBytes);
+
+    updateBoxCounts();
+    renderDecryptedSection();
+    renderEncryptedSection();
   } catch (err) {
-    filesTableBody.innerHTML = `<tr><td colspan="5" class="loading-cell" style="color: var(--danger)">Failed to load vault files: ${err.message}</td></tr>`;
+    decryptedFilesTableBody.innerHTML = `<tr><td colspan="6" class="loading-cell" style="color: var(--danger)">Failed to load vault files: ${err.message}</td></tr>`;
   }
 };
 
-function updateFolderCounts() {
-  fCountAll.textContent = `${currentFiles.length} files`;
-  fCountPhotos.textContent = `${currentFiles.filter(f => isCategory(f, 'Photos')).length} files`;
-  fCountVideos.textContent = `${currentFiles.filter(f => isCategory(f, 'Videos')).length} files`;
-  fCountAudio.textContent = `${currentFiles.filter(f => isCategory(f, 'Audio')).length} files`;
-  fCountDocs.textContent = `${currentFiles.filter(f => isCategory(f, 'Documents')).length} files`;
-  fCountArchives.textContent = `${currentFiles.filter(f => isCategory(f, 'Archives')).length} files`;
+function updateBoxCounts() {
+  boxCountAll.textContent = `${currentFiles.length} files`;
+  boxCountImages.textContent = `${currentFiles.filter(f => isBoxCategory(f, 'Photos')).length} files`;
+  boxCountVideos.textContent = `${currentFiles.filter(f => isBoxCategory(f, 'Videos')).length} files`;
+  boxCountMusic.textContent = `${currentFiles.filter(f => isBoxCategory(f, 'Audio')).length} files`;
+  boxCountOther.textContent = `${currentFiles.filter(f => isBoxCategory(f, 'Other')).length} files`;
 }
 
-function isCategory(file, cat) {
+function isBoxCategory(file, box) {
   const c = (file.category || '').toLowerCase();
-  const target = cat.toLowerCase();
-  if (c === target) return true;
-  if (target === 'photos' && (c === 'photo' || c === 'images' || c === 'image')) return true;
-  if (target === 'videos' && (c === 'video')) return true;
-  if (target === 'documents' && (c === 'document' || c === 'docs' || c === 'doc')) return true;
+  const target = box.toLowerCase();
+  if (target === 'all') return true;
+  if (target === 'photos' && (c === 'photos' || c === 'photo' || c === 'images' || c === 'image')) return true;
+  if (target === 'videos' && (c === 'videos' || c === 'video')) return true;
+  if (target === 'audio' && (c === 'audio' || c === 'music' || c === 'sound')) return true;
+  if (target === 'other' && (c === 'documents' || c === 'document' || c === 'docs' || c === 'archives' || c === 'archive' || c === 'general')) return true;
   return false;
 }
 
-function getFilteredFiles() {
-  if (activeCategory === 'all') return currentFiles;
-  return currentFiles.filter(f => isCategory(f, activeCategory));
+function getFilteredDecryptedFiles() {
+  if (activeBox === 'all') return currentFiles;
+  return currentFiles.filter(f => isBoxCategory(f, activeBox));
 }
 
-function renderFilesTable() {
-  const filtered = getFilteredFiles();
-  recoverAllCount.textContent = filtered.length;
+function renderDecryptedSection() {
+  const files = getFilteredDecryptedFiles();
+  decryptedRecoverCount.textContent = files.length;
 
-  if (filtered.length === 0) {
-    filesTableBody.innerHTML = `<tr><td colspan="5" class="loading-cell">No files found in this category.</td></tr>`;
+  if (files.length === 0) {
+    decryptedFilesTableBody.innerHTML = `<tr><td colspan="6" class="loading-cell">No decrypted files in this box.</td></tr>`;
     return;
   }
 
   const baseUrl = serverUrlInput.value.trim().replace(/\/$/, '');
   const key = adminKeyInput.value.trim();
 
-  filesTableBody.innerHTML = filtered.map(f => {
-    const decryptedUrl = `${baseUrl}/api/admin/user/${encodeURIComponent(currentUserKey)}/recover/${encodeURIComponent(f.itemId)}?mode=decrypted&adminKey=${encodeURIComponent(key)}`;
-    const encryptedUrl = `${baseUrl}/api/admin/user/${encodeURIComponent(currentUserKey)}/recover/${encodeURIComponent(f.itemId)}?mode=encrypted&adminKey=${encodeURIComponent(key)}`;
+  decryptedFilesTableBody.innerHTML = files.map(f => {
+    const isDownloaded = downloadedFileIds.has(f.itemId);
+    const statusBadge = isDownloaded
+      ? `<span class="badge-status-downloaded">💾 Downloaded &amp; Decrypted</span>`
+      : `<span class="badge-status-ready">✅ Decrypted from DB</span>`;
+
+    const catIcon = getCategoryIcon(f.category);
 
     return `
       <tr>
-        <td><span class="badge-tag tag-normal">${escapeHtml(f.category || 'General')}</span></td>
+        <td><span style="font-size: 18px;">${catIcon}</span></td>
         <td>
-          <strong style="cursor: pointer; color: var(--accent);" onclick="recoverSingleFile('${escapeHtml(f.itemId)}', '${escapeHtml(f.fileName)}', '${recoveryMode}')" title="Click to recover ${recoveryMode}">
+          <strong style="color: var(--accent); cursor: pointer;" onclick="recoverSingleFile('${escapeHtml(f.itemId)}', '${escapeHtml(f.fileName)}', 'decrypted')" title="Click to download decrypted">
             ${escapeHtml(f.fileName || f.itemId)}
           </strong>
         </td>
         <td>${formatBytes(f.fileSizeBytes)}</td>
+        <td>${statusBadge}</td>
         <td>${formatDate(f.uploadedAt)}</td>
         <td>
           <button class="btn-action-decrypted" onclick="recoverSingleFile('${escapeHtml(f.itemId)}', '${escapeHtml(f.fileName)}', 'decrypted')">
-            🔓 Decrypted
+            🔓 Recover Decrypted
           </button>
+        </td>
+      </tr>
+    `;
+  }).join('');
+}
+
+function renderEncryptedSection() {
+  encryptedRecoverCount.textContent = currentFiles.length;
+
+  if (currentFiles.length === 0) {
+    encryptedFilesTableBody.innerHTML = `<tr><td colspan="6" class="loading-cell">No encrypted files in cloud.</td></tr>`;
+    return;
+  }
+
+  const baseUrl = serverUrlInput.value.trim().replace(/\/$/, '');
+  const key = adminKeyInput.value.trim();
+
+  encryptedFilesTableBody.innerHTML = currentFiles.map(f => {
+    return `
+      <tr>
+        <td><code>${escapeHtml(f.itemId)}.enc</code></td>
+        <td>${escapeHtml(f.fileName || f.itemId)}</td>
+        <td><span class="badge-tag tag-normal">${escapeHtml(f.category || 'General')}</span></td>
+        <td>${formatBytes(f.fileSizeBytes)}</td>
+        <td><span class="badge-tag tag-normal">Cloudflare R2 (AES-GCM)</span></td>
+        <td>
           <button class="btn-action-encrypted" onclick="recoverSingleFile('${escapeHtml(f.itemId)}', '${escapeHtml(f.fileName)}', 'encrypted')">
-            🔒 Encrypted
+            🔒 Download .enc
           </button>
         </td>
       </tr>
@@ -341,11 +415,26 @@ window.recoverSingleFile = function(itemId, fileName, mode) {
 
   const downloadUrl = `${baseUrl}/api/admin/user/${encodeURIComponent(currentUserKey)}/recover/${encodeURIComponent(itemId)}?mode=${mode}&adminKey=${encodeURIComponent(key)}`;
   triggerDownload(downloadUrl, mode === 'encrypted' ? `${itemId}.enc` : (fileName || `${itemId}.bin`));
+  downloadedFileIds.add(itemId);
+
+  if (mode === 'decrypted') {
+    renderDecryptedSection();
+  }
 
   setTimeout(() => {
     progressContainer.classList.add('hidden');
   }, 2500);
 };
+
+function getCategoryIcon(cat) {
+  const c = (cat || '').toLowerCase();
+  if (c.includes('photo') || c.includes('image')) return '🖼️';
+  if (c.includes('video')) return '🎬';
+  if (c.includes('audio') || c.includes('music')) return '🎵';
+  if (c.includes('doc')) return '📄';
+  if (c.includes('archive') || c.includes('zip')) return '🗂️';
+  return '📁';
+}
 
 function escapeHtml(str) {
   if (!str) return '';

@@ -117,118 +117,176 @@
       </div>
     </main>
 
-    <!-- Modal: User Vault Explorer & Disaster Recovery -->
-    <div id="userFilesModal" class="modal-overlay hidden">
-      <div class="modal-dialog">
-        <div class="modal-header">
-          <div class="modal-title-area">
-            <h3 id="modalUserName">User Vault</h3>
-            <p id="modalUserEmail" class="modal-sub"></p>
+    <!-- Full Page: User Vault Detail View -->
+    <div id="vaultDetailView" class="vault-detail-page hidden">
+      <!-- Back Navigation & User Header -->
+      <div class="detail-top-nav">
+        <button id="btnBackToUsers" class="btn-back">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M19 12H5M12 19l-7-7 7-7"/>
+          </svg>
+          Back to Users List
+        </button>
+
+        <div class="detail-header-info">
+          <div class="detail-user-badge">
+            <h2 id="detailUserName">User Vault</h2>
+            <span id="detailUserEmail" class="detail-email"></span>
           </div>
-          <button id="btnCloseModal" class="btn-close">&times;</button>
+          <div class="detail-stats-pills">
+            <span id="detailTotalFilesPill" class="stat-pill">0 files</span>
+            <span id="detailTotalSizePill" class="stat-pill">0 MB</span>
+            <button id="btnRecoverManifest" class="btn-recover-manifest" title="Download master vault_index.json">
+              📜 Recover Manifest
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Main Navigation Tabs: Encrypted vs Decrypted -->
+      <div class="vault-section-tabs">
+        <button id="tabBtnDecrypted" class="vault-tab-btn active">
+          🔓 Decrypted Vault (Images, Videos, Music, Other)
+        </button>
+        <button id="tabBtnEncrypted" class="vault-tab-btn">
+          🔒 Encrypted Files (Raw Cloudflare R2 / Database)
+        </button>
+      </div>
+
+      <!-- Active Progress Bar for Recovery -->
+      <div id="downloadProgressBarContainer" class="progress-container hidden">
+        <div class="progress-info">
+          <span id="progressStatusText">Recovering files...</span>
+          <span id="progressPercentText">0%</span>
+        </div>
+        <div class="progress-bar-bg">
+          <div id="progressBarFill" class="progress-bar-fill" style="width: 0%;"></div>
+        </div>
+      </div>
+
+      <!-- SECTION 1: DECRYPTED VAULT (BOXES & DECRYPTED RECOVERY) -->
+      <div id="sectionDecrypted" class="vault-section-content">
+        <div class="section-intro-bar">
+          <div>
+            <h3>Decrypted Category Vault</h3>
+            <p class="section-sub">Browse, inspect, and recover original decrypted files from database</p>
+          </div>
+          <button id="btnRecoverAllDecrypted" class="btn-recover-all">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            Recover All Decrypted (<span id="decryptedRecoverCount">0</span>)
+          </button>
         </div>
 
-        <div class="modal-body">
-          <!-- Folder Grid (Photos, Videos, Audio, Documents, Archives) -->
-          <div class="vault-folders-grid">
-            <div class="folder-card active" data-category="all">
-              <div class="folder-icon">📁</div>
-              <div class="folder-info">
-                <span class="folder-title">All Files</span>
-                <span id="fCountAll" class="folder-count">0 files</span>
-              </div>
+        <!-- 4 Visual Boxes: Images, Videos, Music, Other -->
+        <div class="decrypted-boxes-grid">
+          <div class="vault-box active" data-box="all">
+            <div class="box-icon">📁</div>
+            <div class="box-meta">
+              <span class="box-title">All Media</span>
+              <span id="boxCountAll" class="box-count">0 files</span>
             </div>
-            <div class="folder-card" data-category="Photos">
-              <div class="folder-icon">🖼️</div>
-              <div class="folder-info">
-                <span class="folder-title">Photos</span>
-                <span id="fCountPhotos" class="folder-count">0 files</span>
-              </div>
-            </div>
-            <div class="folder-card" data-category="Videos">
-              <div class="folder-icon">🎬</div>
-              <div class="folder-info">
-                <span class="folder-title">Videos</span>
-                <span id="fCountVideos" class="folder-count">0 files</span>
-              </div>
-            </div>
-            <div class="folder-card" data-category="Audio">
-              <div class="folder-icon">🎵</div>
-              <div class="folder-info">
-                <span class="folder-title">Audio</span>
-                <span id="fCountAudio" class="folder-count">0 files</span>
-              </div>
-            </div>
-            <div class="folder-card" data-category="Documents">
-              <div class="folder-icon">📄</div>
-              <div class="folder-info">
-                <span class="folder-title">Documents</span>
-                <span id="fCountDocs" class="folder-count">0 files</span>
-              </div>
-            </div>
-            <div class="folder-card" data-category="Archives">
-              <div class="folder-icon">🗂️</div>
-              <div class="folder-info">
-                <span class="folder-title">Archives</span>
-                <span id="fCountArchives" class="folder-count">0 files</span>
-              </div>
-            </div>
+            <span class="box-badge">All</span>
           </div>
 
-          <!-- Overall Progress Bar for Recover All / Active Downloads -->
-          <div id="downloadProgressBarContainer" class="progress-container hidden">
-            <div class="progress-info">
-              <span id="progressStatusText">Recovering files...</span>
-              <span id="progressPercentText">0%</span>
+          <div class="vault-box" data-box="Photos">
+            <div class="box-icon">🖼️</div>
+            <div class="box-meta">
+              <span class="box-title">Images</span>
+              <span id="boxCountImages" class="box-count">0 files</span>
             </div>
-            <div class="progress-bar-bg">
-              <div id="progressBarFill" class="progress-bar-fill" style="width: 0%;"></div>
-            </div>
+            <span class="box-badge">Photos</span>
           </div>
 
-          <!-- Action & Mode Bar -->
-          <div class="modal-action-bar">
-            <div class="mode-toggles">
-              <span class="mode-label">Mode:</span>
-              <button id="btnModeDecrypted" class="btn-toggle active" title="Download original decrypted file">🔓 Decrypted</button>
-              <button id="btnModeEncrypted" class="btn-toggle" title="Download raw .enc file">🔒 Encrypted</button>
+          <div class="vault-box" data-box="Videos">
+            <div class="box-icon">🎬</div>
+            <div class="box-meta">
+              <span class="box-title">Videos</span>
+              <span id="boxCountVideos" class="box-count">0 files</span>
             </div>
-
-            <div class="action-buttons-group">
-              <button id="btnRecoverAll" class="btn-recover-all">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                  <polyline points="7 10 12 15 17 10"/>
-                  <line x1="12" y1="15" x2="12" y2="3"/>
-                </svg>
-                Recover All (<span id="recoverAllCount">0</span>)
-              </button>
-
-              <button id="btnRecoverManifest" class="btn-recover-manifest" title="Download master vault_index.json">
-                📜 Recover Manifest
-              </button>
-            </div>
+            <span class="box-badge">Videos</span>
           </div>
 
-          <!-- Files List -->
-          <div class="files-list-container">
-            <table class="files-table">
-              <thead>
-                <tr>
-                  <th>Category</th>
-                  <th>File Name</th>
-                  <th>Size</th>
-                  <th>Uploaded</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody id="filesTableBody">
-                <tr>
-                  <td colspan="5" class="loading-cell">Loading vault files...</td>
-                </tr>
-              </tbody>
-            </table>
+          <div class="vault-box" data-box="Audio">
+            <div class="box-icon">🎵</div>
+            <div class="box-meta">
+              <span class="box-title">Music</span>
+              <span id="boxCountMusic" class="box-count">0 files</span>
+            </div>
+            <span class="box-badge">Audio</span>
           </div>
+
+          <div class="vault-box" data-box="Other">
+            <div class="box-icon">📄</div>
+            <div class="box-meta">
+              <span class="box-title">Other / Docs</span>
+              <span id="boxCountOther" class="box-count">0 files</span>
+            </div>
+            <span class="box-badge">Docs/Zips</span>
+          </div>
+        </div>
+
+        <!-- Decrypted Files Table -->
+        <div class="table-container detail-table-box">
+          <table class="files-table">
+            <thead>
+              <tr>
+                <th>Type</th>
+                <th>Decrypted File Name</th>
+                <th>Size</th>
+                <th>Status (Database)</th>
+                <th>Date Uploaded</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="decryptedFilesTableBody">
+              <tr>
+                <td colspan="6" class="loading-cell">Loading decrypted files...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- SECTION 2: ENCRYPTED SECTION (RAW R2 STORAGE) -->
+      <div id="sectionEncrypted" class="vault-section-content hidden">
+        <div class="section-intro-bar">
+          <div>
+            <h3>Raw Encrypted Storage (.enc)</h3>
+            <p class="section-sub">Encrypted AES-GCM binary blobs stored directly in Cloudflare R2 bucket</p>
+          </div>
+          <button id="btnRecoverAllEncrypted" class="btn-recover-all" style="background: #1f6feb;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            Recover All Encrypted (<span id="encryptedRecoverCount">0</span>)
+          </button>
+        </div>
+
+        <!-- Encrypted Files Table -->
+        <div class="table-container detail-table-box">
+          <table class="files-table">
+            <thead>
+              <tr>
+                <th>Encrypted Key / Item ID</th>
+                <th>Original Name</th>
+                <th>Category</th>
+                <th>Raw Size</th>
+                <th>Storage Mode</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="encryptedFilesTableBody">
+              <tr>
+                <td colspan="6" class="loading-cell">Loading encrypted files...</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </div>
     </div>
