@@ -940,6 +940,221 @@ app.post('/api/upgrade/activate', async (req, res) => {
   }
 });
 
+// ==========================================
+// 🛡️ DIALERVAULT ADMIN CONTROL CENTER APIS
+// ==========================================
+
+const ADMIN_SECRET_KEY = process.env.ADMIN_SECRET_KEY || 'dialervault_admin_secret_2026';
+
+function verifyAdminAuth(req, res, next) {
+  const adminKey = req.headers['x-admin-key'] || req.headers['authorization'] || req.query.adminKey;
+  if (!adminKey || (adminKey !== ADMIN_SECRET_KEY && adminKey !== `Bearer ${ADMIN_SECRET_KEY}`)) {
+    return res.status(401).json({ error: 'Unauthorized: Valid Admin API key required' });
+  }
+  next();
+}
+
+// 1. Get all users, file counts, quota usage, and unusual activity status
+app.get('/api/admin/users', verifyAdminAuth, async (req, res) => {
+  try {
+    const usersMap = {};
+
+    if (firebaseDb) {
+      const snap = await firebaseDb.ref('users').once('value');
+      if (snap.exists()) {
+        const data = snap.val();
+        for (const [userKey, val] of Object.entries(data)) {
+          if (!val) continue;
+          const quota = val.quota || {};
+          const files = val.files || {};
+          const fileList = Object.values(files).filter(Boolean);
+          const totalFiles = fileList.length;
+          const totalBytes = fileList.reduce((acc, f) => acc + (f.fileSizeBytes || 0), 0);
+          const limitBytes = quota.limitBytes || (quota.isLifetime100GB ? LIFETIME_LIMIT : FREE_LIMIT);
+          const isQuotaExceeded = totalBytes > limitBytes;
+          
+          // Suspicious flag: extreme files or rapid quota overflow
+          const isSuspicious = isQuotaExceeded || totalFiles > 5000 || (quota.purchased_packs > 50);
+
+          usersMap[userKey] = {
+            userKey,
+            email: val.last_payment?.email || fileList[0]?.email || userKey,
+            totalFiles,
+            usedBytes: totalBytes || quota.usedBytes || 0,
+            limitBytes,
+            isLifetime100GB: !!quota.isLifetime100GB,
+            purchased_packs: quota.purchased_packs || (quota.isLifetime100GB ? 1 : 0),
+            total_gb: quota.total_gb || Math.round(limitBytes / (1024 * 1024 * 1024)),
+            hasManifest: !!val.manifest,
+            lastBackupTime: fileList.reduce((max, f) => Math.max(max, f.uploadedAt || 0), 0),
+            isSuspicious,
+            status: isSuspicious ? 'Flagged / Unusual Activity' : 'Normal Active'
+          };
+        }
+      }
+    }
+
+    // Also include any users in local vault storage
+    try {
+      const vaultAppDir = path.join(STORAGE_ROOT, APP_PACKAGE_NAME);
+      if (fs.existsSync(vaultAppDir)) {
+        const localUsers = fs.readdirSync(vaultAppDir, { withFileTypes: true });
+        for (const u of localUsers) {
+          if (u.isDirectory()) {
+            const userKey = u.name;
+            if (!usersMap[userKey]) {
+              usersMap[userKey] = {
+                userKey,
+                email: userKey,
+                totalFiles: 0,
+                usedBytes: 0,
+                limitBytes: FREE_LIMIT,
+                isLifetime100GB: false,
+                hasManifest: fs.existsSync(path.join(vaultAppDir, userKey, 'Manifest', 'vault_index.json')),
+                lastBackupTime: 0,
+                isSuspicious: false,
+                status: 'Normal Active (Local)'
+              };
+            }
+          }
+        }
+      }
+    } catch (_) {}
+
+    res.json({
+      success: true,
+      count: Object.keys(usersMap).length,
+      users: Object.values(usersMap)
+    });
+  } catch (err) {
+    console.error('Admin users fetch error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. Get detailed files for a specific user
+app.get('/api/admin/user/:userKey/files', verifyAdminAuth, async (req, res) => {
+  try {
+    const { userKey } = req.params;
+    let fileList = [];
+    let manifest = null;
+
+    if (firebaseDb) {
+      const filesSnap = await firebaseDb.ref(`users/${userKey}/files`).once('value');
+      if (filesSnap.exists()) {
+        fileList = Object.values(filesSnap.val()).filter(Boolean);
+      }
+      const manifestSnap = await firebaseDb.ref(`users/${userKey}/manifest`).once('value');
+      if (manifestSnap.exists()) {
+        manifest = manifestSnap.val();
+      }
+    }
+
+    // Local files scan fallback
+    if (fileList.length === 0) {
+      const userDir = path.join(STORAGE_ROOT, APP_PACKAGE_NAME, userKey);
+      if (fs.existsSync(userDir)) {
+        const walkDir = (dir, cat = 'General') => {
+          const entries = fs.readdirSync(dir, { withFileTypes: true });
+          for (const e of entries) {
+            const fullPath = path.join(dir, e.name);
+            if (e.isDirectory()) {
+              walkDir(fullPath, e.name);
+            } else if (e.name.endsWith('.enc')) {
+              const stat = fs.statSync(fullPath);
+              fileList.push({
+                itemId: e.name.replace('.enc', ''),
+                fileName: e.name,
+                category: cat,
+                fileSizeBytes: stat.size,
+                uploadedAt: stat.mtimeMs,
+                r2Key: `local_vault_storage`
+              });
+            }
+          }
+        };
+        walkDir(userDir);
+      }
+    }
+
+    res.json({
+      success: true,
+      userKey,
+      totalFiles: fileList.length,
+      hasManifest: !!manifest,
+      files: fileList
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. Admin Recover: Download user's encrypted file or manifest directly to Admin
+app.get('/api/admin/user/:userKey/recover/:itemId', verifyAdminAuth, async (req, res) => {
+  try {
+    const { userKey, itemId } = req.params;
+
+    // A. If itemId is 'manifest', return user's vault_index.json
+    if (itemId === 'manifest') {
+      if (firebaseDb) {
+        const snap = await firebaseDb.ref(`users/${userKey}/manifest`).once('value');
+        if (snap.exists()) {
+          const val = snap.val();
+          res.setHeader('Content-Disposition', `attachment; filename="${userKey}_vault_index.json"`);
+          res.setHeader('Content-Type', 'application/json');
+          return res.send(typeof val === 'string' ? val : JSON.stringify(val, null, 2));
+        }
+      }
+
+      if (r2Client) {
+        try {
+          const manifestR2Key = `${APP_PACKAGE_NAME}/${userKey}/Manifest/vault_index.json`;
+          const r2Res = await r2Client.send(new GetObjectCommand({
+            Bucket: R2_BUCKET_NAME,
+            Key: manifestR2Key
+          }));
+          res.setHeader('Content-Disposition', `attachment; filename="${userKey}_vault_index.json"`);
+          res.setHeader('Content-Type', 'application/json');
+          return r2Res.Body.pipe(res);
+        } catch (_) {}
+      }
+
+      const localManifest = path.join(STORAGE_ROOT, APP_PACKAGE_NAME, userKey, 'Manifest', 'vault_index.json');
+      if (fs.existsSync(localManifest)) {
+        return res.download(localManifest, `${userKey}_vault_index.json`);
+      }
+      return res.status(404).json({ error: 'Manifest not found for user' });
+    }
+
+    // B. Download encrypted file chunk from R2
+    if (r2Client) {
+      const categories = ['Photos', 'Videos', 'Audio', 'Documents', 'Archives', 'General'];
+      for (const cat of categories) {
+        const keyToTry = `${APP_PACKAGE_NAME}/${userKey}/${cat}/${itemId}.enc`;
+        try {
+          const r2Res = await r2Client.send(new GetObjectCommand({
+            Bucket: R2_BUCKET_NAME,
+            Key: keyToTry
+          }));
+          res.setHeader('Content-Disposition', `attachment; filename="${itemId}.enc"`);
+          res.setHeader('Content-Type', 'application/octet-stream');
+          return r2Res.Body.pipe(res);
+        } catch (_) {}
+      }
+    }
+
+    // C. Check local storage
+    const localFile = findLocalFile(userKey, itemId);
+    if (localFile && fs.existsSync(localFile)) {
+      return res.download(localFile, `${itemId}.enc`);
+    }
+
+    res.status(404).json({ error: 'Requested file not found in R2 or local storage' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(port, () => {
   console.log(`🚀 DialerVault Central Cloud Backend running on port ${port}`);
 });
