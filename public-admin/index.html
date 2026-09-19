@@ -298,6 +298,65 @@
     </div>
   </div>
 
+  <!-- Decrypted Media Preview Player Modal -->
+  <div id="mediaPlayerModal" class="media-modal-backdrop hidden">
+    <div class="media-modal-card">
+      <div class="media-modal-header">
+        <div class="media-modal-title-box">
+          <span id="playerTypeIcon" class="player-icon">🎬</span>
+          <div>
+            <h3 id="playerFileName">media_preview</h3>
+            <span id="playerMeta" class="player-meta">Loading...</span>
+          </div>
+        </div>
+        <div class="media-modal-actions">
+          <button id="btnPlayerDownload" class="btn-player-download" title="Download Decrypted File">⬇️ Download</button>
+          <button id="btnPlayerClose" class="btn-close-modal" title="Close Preview">&times;</button>
+        </div>
+      </div>
+
+      <div class="media-player-body">
+        <!-- Video Player -->
+        <div id="videoContainer" class="media-container hidden">
+          <video id="videoPlayer" controls playsinline preload="metadata">
+            Your browser does not support HTML5 video playback.
+          </video>
+        </div>
+
+        <!-- Image Preview -->
+        <div id="imageContainer" class="media-container hidden">
+          <img id="imagePreview" alt="Decrypted Photo Preview" />
+        </div>
+
+        <!-- Audio Player -->
+        <div id="audioContainer" class="media-container hidden">
+          <div class="audio-player-card">
+            <div class="audio-wave-anim">
+              <span></span><span></span><span></span><span></span><span></span>
+            </div>
+            <p id="audioTrackName" class="audio-track-title">Audio Track</p>
+            <audio id="audioPlayer" controls preload="metadata"></audio>
+          </div>
+        </div>
+
+        <!-- Document / Other Preview -->
+        <div id="docContainer" class="media-container hidden">
+          <div class="doc-preview-card">
+            <span class="doc-big-icon">📄</span>
+            <p id="docNotice">Document file preview</p>
+            <button id="btnDocDownload" class="btn-primary">Download to View</button>
+          </div>
+        </div>
+
+        <!-- Loading spinner for media player -->
+        <div id="mediaLoadingSpinner" class="media-spinner-overlay hidden">
+          <div class="spinner"></div>
+          <span>Streaming &amp; Decrypting Media...</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
 </body>
 </html>

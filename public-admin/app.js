@@ -378,9 +378,9 @@ function renderDecryptedSection() {
 
     return `
       <tr>
-        <td><span style="font-size: 18px;">${catIcon}</span></td>
+        <td><span style="font-size: 18px; cursor: pointer;" onclick="openMediaPreviewById('${escapeHtml(f.itemId)}')">${catIcon}</span></td>
         <td>
-          <strong style="color: var(--accent); cursor: pointer;" onclick="recoverSingleFile('${escapeHtml(f.itemId)}', '${escapeHtml(f.fileName)}', 'decrypted')" title="Click to download decrypted">
+          <strong style="color: var(--accent); cursor: pointer;" onclick="openMediaPreviewById('${escapeHtml(f.itemId)}')" title="Click to preview / play">
             ${escapeHtml(f.fileName || f.itemId)}
           </strong>
         </td>
@@ -388,7 +388,10 @@ function renderDecryptedSection() {
         <td>${statusBadge}</td>
         <td>${formatDate(f.uploadedAt)}</td>
         <td>
-          <div style="display: flex; gap: 6px;">
+          <div style="display: flex; gap: 6px; align-items: center;">
+            <button class="btn-action-preview" onclick="openMediaPreviewById('${escapeHtml(f.itemId)}')" title="Play / Preview media">
+              ▶️ Preview
+            </button>
             <button class="btn-action-decrypted" onclick="recoverSingleFile('${escapeHtml(f.itemId)}', '${escapeHtml(f.fileName)}', 'decrypted')">
               🔓 Recover
             </button>
@@ -547,6 +550,158 @@ function getCategoryIcon(cat) {
   return '📁';
 }
 
+// ========================================================
+// MEDIA PREVIEW PLAYER MODAL LOGIC (PHOTO & VIDEO PLAYER)
+// ========================================================
+const mediaPlayerModal = document.getElementById('mediaPlayerModal');
+const playerTypeIcon = document.getElementById('playerTypeIcon');
+const playerFileName = document.getElementById('playerFileName');
+const playerMeta = document.getElementById('playerMeta');
+const btnPlayerDownload = document.getElementById('btnPlayerDownload');
+const btnPlayerClose = document.getElementById('btnPlayerClose');
+
+const videoContainer = document.getElementById('videoContainer');
+const videoPlayer = document.getElementById('videoPlayer');
+const imageContainer = document.getElementById('imageContainer');
+const imagePreview = document.getElementById('imagePreview');
+const audioContainer = document.getElementById('audioContainer');
+const audioPlayer = document.getElementById('audioPlayer');
+const audioTrackName = document.getElementById('audioTrackName');
+const docContainer = document.getElementById('docContainer');
+const docNotice = document.getElementById('docNotice');
+const btnDocDownload = document.getElementById('btnDocDownload');
+const mediaLoadingSpinner = document.getElementById('mediaLoadingSpinner');
+
+let currentPreviewFile = null;
+
+window.openMediaPreviewById = function(itemId) {
+  const file = currentFiles.find(f => f.itemId === itemId);
+  if (!file) return;
+  openMediaPreview(file);
+};
+
+window.openMediaPreview = function(file) {
+  currentPreviewFile = file;
+  const baseUrl = serverUrlInput.value.trim().replace(/\/$/, '');
+  const key = adminKeyInput.value.trim();
+
+  playerFileName.textContent = file.fileName || file.itemId;
+  playerMeta.textContent = `${file.category} • ${formatBytes(file.fileSizeBytes)} • Decrypted from database`;
+
+  // Hide all containers
+  videoContainer.classList.add('hidden');
+  imageContainer.classList.add('hidden');
+  audioContainer.classList.add('hidden');
+  docContainer.classList.add('hidden');
+  mediaLoadingSpinner.classList.remove('hidden');
+
+  // Reset media elements
+  videoPlayer.pause();
+  videoPlayer.src = '';
+  audioPlayer.pause();
+  audioPlayer.src = '';
+  imagePreview.src = '';
+
+  const mediaUrl = `${baseUrl}/api/admin/user/${encodeURIComponent(currentUserKey)}/recover/${encodeURIComponent(file.itemId)}?mode=decrypted&adminKey=${encodeURIComponent(key)}`;
+
+  const fileName = (file.fileName || '').toLowerCase();
+  const category = (file.category || '').toLowerCase();
+
+  const isVideo = category.includes('video') || fileName.endsWith('.mp4') || fileName.endsWith('.mov') || fileName.endsWith('.mkv') || fileName.endsWith('.webm') || fileName.endsWith('.3gp');
+  const isImage = category.includes('photo') || category.includes('image') || fileName.endsWith('.jpg') || fileName.endsWith('.jpeg') || fileName.endsWith('.png') || fileName.endsWith('.gif') || fileName.endsWith('.webp') || fileName.endsWith('.bmp');
+  const isAudio = category.includes('audio') || category.includes('music') || fileName.endsWith('.mp3') || fileName.endsWith('.wav') || fileName.endsWith('.m4a') || fileName.endsWith('.ogg') || fileName.endsWith('.flac');
+
+  if (isVideo) {
+    playerTypeIcon.textContent = '🎬';
+    videoContainer.classList.remove('hidden');
+    videoPlayer.src = mediaUrl;
+    videoPlayer.load();
+
+    const onCanPlay = () => {
+      mediaLoadingSpinner.classList.add('hidden');
+      videoPlayer.play().catch(() => {});
+      videoPlayer.removeEventListener('canplay', onCanPlay);
+    };
+    videoPlayer.addEventListener('canplay', onCanPlay);
+
+    setTimeout(() => mediaLoadingSpinner.classList.add('hidden'), 3500);
+  } else if (isImage) {
+    playerTypeIcon.textContent = '🖼️';
+    imageContainer.classList.remove('hidden');
+    imagePreview.onload = () => {
+      mediaLoadingSpinner.classList.add('hidden');
+    };
+    imagePreview.onerror = () => {
+      mediaLoadingSpinner.classList.add('hidden');
+    };
+    imagePreview.src = mediaUrl;
+  } else if (isAudio) {
+    playerTypeIcon.textContent = '🎵';
+    audioContainer.classList.remove('hidden');
+    audioTrackName.textContent = file.fileName || file.itemId;
+    audioPlayer.src = mediaUrl;
+    audioPlayer.load();
+
+    const onAudioCanPlay = () => {
+      mediaLoadingSpinner.classList.add('hidden');
+      audioPlayer.play().catch(() => {});
+      audioPlayer.removeEventListener('canplay', onAudioCanPlay);
+    };
+    audioPlayer.addEventListener('canplay', onAudioCanPlay);
+
+    setTimeout(() => mediaLoadingSpinner.classList.add('hidden'), 2500);
+  } else {
+    playerTypeIcon.textContent = '📄';
+    docContainer.classList.remove('hidden');
+    docNotice.textContent = `${file.fileName || file.itemId} (${formatBytes(file.fileSizeBytes)})`;
+    mediaLoadingSpinner.classList.add('hidden');
+  }
+
+  mediaPlayerModal.classList.remove('hidden');
+};
+
+window.closeMediaPreview = function() {
+  videoPlayer.pause();
+  videoPlayer.src = '';
+  audioPlayer.pause();
+  audioPlayer.src = '';
+  imagePreview.src = '';
+  mediaPlayerModal.classList.add('hidden');
+  currentPreviewFile = null;
+};
+
+if (btnPlayerClose) {
+  btnPlayerClose.addEventListener('click', closeMediaPreview);
+}
+
+if (mediaPlayerModal) {
+  mediaPlayerModal.addEventListener('click', (e) => {
+    if (e.target === mediaPlayerModal) closeMediaPreview();
+  });
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && mediaPlayerModal && !mediaPlayerModal.classList.contains('hidden')) {
+    closeMediaPreview();
+  }
+});
+
+if (btnPlayerDownload) {
+  btnPlayerDownload.addEventListener('click', () => {
+    if (currentPreviewFile) {
+      recoverSingleFile(currentPreviewFile.itemId, currentPreviewFile.fileName, 'decrypted');
+    }
+  });
+}
+
+if (btnDocDownload) {
+  btnDocDownload.addEventListener('click', () => {
+    if (currentPreviewFile) {
+      recoverSingleFile(currentPreviewFile.itemId, currentPreviewFile.fileName, 'decrypted');
+    }
+  });
+}
+
 function escapeHtml(str) {
   if (!str) return '';
   return String(str)
@@ -559,3 +714,4 @@ function escapeHtml(str) {
 
 // Initial load
 fetchUsers();
+
