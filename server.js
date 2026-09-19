@@ -86,6 +86,56 @@ const {
   HeadObjectCommand
 } = require('@aws-sdk/client-s3');
 
+// 2. Initialize Firebase Admin (for Realtime Database / metadata)
+let firebaseDb = null;
+
+function initFirebase() {
+  try {
+    let serviceAccount = null;
+    if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    } else if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
+      serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH);
+    } else {
+      try {
+        serviceAccount = require('./firebase-service-account.json');
+      } catch (ignored) {}
+    }
+
+    const databaseURL = process.env.FIREBASE_DATABASE_URL;
+
+    if (serviceAccount && databaseURL) {
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        databaseURL
+      });
+      firebaseDb = admin.database();
+      console.log('✅ Firebase Admin connected successfully');
+    } else {
+      console.warn('⚠️ Firebase credentials missing. Using local in-memory/file metadata fallback.');
+    }
+  } catch (err) {
+    console.error('❌ Firebase Init Error:', err.message);
+  }
+}
+
+initFirebase();
+
+// Fallback in-memory metadata store
+const localDb = {
+  users: {},
+  files: {}
+};
+
+const FREE_LIMIT = 1073741824; // 1.0 GB
+const LIFETIME_LIMIT = 107374182400; // 100 GB
+
+// Helper: Sanitize email for database and key names
+function cleanEmailKey(email) {
+  if (!email) return 'default_user';
+  return email.trim().toLowerCase().replace(/[.#$\[\]]/g, '_');
+}
+
 // 1. Initialize Cloudflare R2 Object Storage (S3-compatible API)
 let r2Client = null;
 const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME || 'dialervault-backups';
