@@ -117,32 +117,100 @@
       </div>
     </main>
 
-    <!-- Modal: User Files & Disaster Recovery -->
+    <!-- Modal: User Vault Explorer & Disaster Recovery -->
     <div id="userFilesModal" class="modal-overlay hidden">
       <div class="modal-dialog">
         <div class="modal-header">
-          <div>
-            <h3 id="modalUserName">User Files</h3>
+          <div class="modal-title-area">
+            <h3 id="modalUserName">User Vault</h3>
             <p id="modalUserEmail" class="modal-sub"></p>
           </div>
           <button id="btnCloseModal" class="btn-close">&times;</button>
         </div>
 
         <div class="modal-body">
-          <div class="modal-action-bar">
-            <div class="modal-stats">
-              <span id="modalFileCount">0 files</span> • <span id="modalTotalSize">0 MB</span>
+          <!-- Folder Grid (Photos, Videos, Audio, Documents, Archives) -->
+          <div class="vault-folders-grid">
+            <div class="folder-card active" data-category="all">
+              <div class="folder-icon">📁</div>
+              <div class="folder-info">
+                <span class="folder-title">All Files</span>
+                <span id="fCountAll" class="folder-count">0 files</span>
+              </div>
             </div>
-            <button id="btnRecoverManifest" class="btn-recover">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                <polyline points="7 10 12 15 17 10"/>
-                <line x1="12" y1="15" x2="12" y2="3"/>
-              </svg>
-              Recover Manifest to Admin
-            </button>
+            <div class="folder-card" data-category="Photos">
+              <div class="folder-icon">🖼️</div>
+              <div class="folder-info">
+                <span class="folder-title">Photos</span>
+                <span id="fCountPhotos" class="folder-count">0 files</span>
+              </div>
+            </div>
+            <div class="folder-card" data-category="Videos">
+              <div class="folder-icon">🎬</div>
+              <div class="folder-info">
+                <span class="folder-title">Videos</span>
+                <span id="fCountVideos" class="folder-count">0 files</span>
+              </div>
+            </div>
+            <div class="folder-card" data-category="Audio">
+              <div class="folder-icon">🎵</div>
+              <div class="folder-info">
+                <span class="folder-title">Audio</span>
+                <span id="fCountAudio" class="folder-count">0 files</span>
+              </div>
+            </div>
+            <div class="folder-card" data-category="Documents">
+              <div class="folder-icon">📄</div>
+              <div class="folder-info">
+                <span class="folder-title">Documents</span>
+                <span id="fCountDocs" class="folder-count">0 files</span>
+              </div>
+            </div>
+            <div class="folder-card" data-category="Archives">
+              <div class="folder-icon">🗂️</div>
+              <div class="folder-info">
+                <span class="folder-title">Archives</span>
+                <span id="fCountArchives" class="folder-count">0 files</span>
+              </div>
+            </div>
           </div>
 
+          <!-- Overall Progress Bar for Recover All / Active Downloads -->
+          <div id="downloadProgressBarContainer" class="progress-container hidden">
+            <div class="progress-info">
+              <span id="progressStatusText">Recovering files...</span>
+              <span id="progressPercentText">0%</span>
+            </div>
+            <div class="progress-bar-bg">
+              <div id="progressBarFill" class="progress-bar-fill" style="width: 0%;"></div>
+            </div>
+          </div>
+
+          <!-- Action & Mode Bar -->
+          <div class="modal-action-bar">
+            <div class="mode-toggles">
+              <span class="mode-label">Mode:</span>
+              <button id="btnModeDecrypted" class="btn-toggle active" title="Download original decrypted file">🔓 Decrypted</button>
+              <button id="btnModeEncrypted" class="btn-toggle" title="Download raw .enc file">🔒 Encrypted</button>
+            </div>
+
+            <div class="action-buttons-group">
+              <button id="btnRecoverAll" class="btn-recover-all">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="7 10 12 15 17 10"/>
+                  <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+                Recover All (<span id="recoverAllCount">0</span>)
+              </button>
+
+              <button id="btnRecoverManifest" class="btn-recover-manifest" title="Download master vault_index.json">
+                📜 Recover Manifest
+              </button>
+            </div>
+          </div>
+
+          <!-- Files List -->
           <div class="files-list-container">
             <table class="files-table">
               <thead>
@@ -151,12 +219,12 @@
                   <th>File Name</th>
                   <th>Size</th>
                   <th>Uploaded</th>
-                  <th>Recovery</th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody id="filesTableBody">
                 <tr>
-                  <td colspan="5" class="loading-cell">Loading files...</td>
+                  <td colspan="5" class="loading-cell">Loading vault files...</td>
                 </tr>
               </tbody>
             </table>
