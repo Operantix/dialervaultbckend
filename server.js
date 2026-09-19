@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const { google } = require('googleapis');
 const admin = require('firebase-admin');
 const stream = require('stream');
 const crypto = require('crypto');
@@ -127,30 +126,6 @@ function getR2ObjectKey(email, category, fileName) {
 }
 
 const APP_PACKAGE_NAME = process.env.APP_PACKAGE_NAME || 'com.operantix.dialervault';
-
-/**
- * Resolves destination folder:
- * Shared Root Drive -> com.operantix.dialervault -> user_name_or_email -> Category (Photos, Videos, etc.)
- */
-async function resolveUserCategoryFolder(email, category) {
-  if (!drive) return null;
-  const rootId = process.env.GOOGLE_DRIVE_FOLDER_ID;
-  if (!rootId) return null;
-
-  // 1. First ensure App Package Name folder exists (com.operantix.dialervault)
-  const appPackageFolderId = await getOrCreateDriveFolder(rootId, APP_PACKAGE_NAME);
-  const parentForUser = appPackageFolderId || rootId;
-
-  // 2. Extract username/handle from email (e.g. "alex" from "alex@gmail.com") or clean email
-  const userNameFolder = email.includes('@') ? email.split('@')[0].trim() : email.trim();
-  const userFolderId = await getOrCreateDriveFolder(parentForUser, userNameFolder);
-  if (!userFolderId) return parentForUser;
-
-  // 3. Category folder inside user folder (Photos, Videos, Documents, etc.)
-  const validCategory = category && category.trim() ? category.trim() : 'General';
-  const categoryFolderId = await getOrCreateDriveFolder(userFolderId, validCategory);
-  return categoryFolderId || userFolderId;
-}
 
 // ---------------------- ENDPOINTS ----------------------
 
