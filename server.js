@@ -1098,10 +1098,100 @@ app.get('/api/admin/user/:userKey/files', verifyAdminAuth, async (req, res) => {
   }
 });
 
-// 3. Admin Recover: Download user's encrypted file or manifest directly to Admin
+// Helper: Decrypt user's persistent vault AES key from manifest
+async function getUserVaultKey(userKey) {
+  try {
+    let manifestStr = null;
+    if (firebaseDb) {
+      const snap = await firebaseDb.ref(`users/${userKey}/manifest`).once('value');
+      if (snap.exists()) manifestStr = snap.val();
+    }
+    if (!manifestStr && r2Client) {
+      try {
+        const manifestR2Key = `${APP_PACKAGE_NAME}/${userKey}/Manifest/vault_index.json`;
+        const r2Res = await r2Client.send(new GetObjectCommand({
+          Bucket: R2_BUCKET_NAME,
+          Key: manifestR2Key
+        }));
+        manifestStr = await r2Res.Body.transformToString();
+      } catch (_) {}
+    }
+    if (!manifestStr) {
+      const localManifest = path.join(STORAGE_ROOT, APP_PACKAGE_NAME, userKey, 'Manifest', 'vault_index.json');
+      if (fs.existsSync(localManifest)) manifestStr = fs.readFileSync(localManifest, 'utf8');
+    }
+
+    if (!manifestStr) return null;
+
+    const manifest = typeof manifestStr === 'string' ? JSON.parse(manifestStr) : manifestStr;
+    const vaultKeyEncBase64 = manifest.vault_key_enc;
+    if (!vaultKeyEncBase64) return null;
+
+    const encBytes = Buffer.from(vaultKeyEncBase64, 'base64');
+    if (encBytes.length <= 28) return null;
+
+    const salt = encBytes.subarray(0, 16);
+    const iv = encBytes.subarray(16, 28);
+    const cipherBytes = encBytes.subarray(28);
+
+    const pin = 'OperanVaultPersistentDefaultSaltKey2026';
+    const kek = crypto.pbkdf2Sync(pin, salt, 65536, 32, 'sha256');
+
+    const authTag = cipherBytes.subarray(cipherBytes.length - 16);
+    const data = cipherBytes.subarray(0, cipherBytes.length - 16);
+
+    const decipher = crypto.createDecipheriv('aes-256-gcm', kek, iv);
+    decipher.setAuthTag(authTag);
+    const rawAesKey = Buffer.concat([decipher.update(data), decipher.final()]);
+    return rawAesKey;
+  } catch (err) {
+    console.warn(`Could not derive vault key for ${userKey}:`, err.message);
+    return null;
+  }
+}
+
+// Helper: Decrypt buffer using AES-GCM (VAULT1 format)
+function decryptVaultBuffer(encryptedBuffer, rawAesKey) {
+  if (encryptedBuffer.length > 18 && encryptedBuffer.subarray(0, 6).toString('utf8') === 'VAULT1') {
+    const iv = encryptedBuffer.subarray(6, 18);
+    const cipherDataWithTag = encryptedBuffer.subarray(18);
+    const authTag = cipherDataWithTag.subarray(cipherDataWithTag.length - 16);
+    const data = cipherDataWithTag.subarray(0, cipherDataWithTag.length - 16);
+
+    const decipher = crypto.createDecipheriv('aes-256-gcm', rawAesKey, iv);
+    decipher.setAuthTag(authTag);
+    return Buffer.concat([decipher.update(data), decipher.final()]);
+  }
+  return encryptedBuffer;
+}
+
+// Helper: Get MIME type from file extension
+function getMimeType(fileName) {
+  const ext = path.extname(fileName || '').toLowerCase();
+  switch (ext) {
+    case '.jpg':
+    case '.jpeg': return 'image/jpeg';
+    case '.png': return 'image/png';
+    case '.gif': return 'image/gif';
+    case '.webp': return 'image/webp';
+    case '.mp4': return 'video/mp4';
+    case '.mov': return 'video/quicktime';
+    case '.mkv': return 'video/x-matroska';
+    case '.mp3': return 'audio/mpeg';
+    case '.m4a': return 'audio/mp4';
+    case '.wav': return 'audio/wav';
+    case '.pdf': return 'application/pdf';
+    case '.zip': return 'application/zip';
+    case '.txt': return 'text/plain';
+    default: return 'application/octet-stream';
+  }
+}
+
+// 3. Admin Recover: Download user's file (Decrypted or Encrypted) or manifest
 app.get('/api/admin/user/:userKey/recover/:itemId', verifyAdminAuth, async (req, res) => {
   try {
     const { userKey, itemId } = req.params;
+    const mode = req.query.mode || 'decrypted'; // 'decrypted' | 'encrypted'
 
     // A. If itemId is 'manifest', return user's vault_index.json
     if (itemId === 'manifest') {
@@ -1135,9 +1225,21 @@ app.get('/api/admin/user/:userKey/recover/:itemId', verifyAdminAuth, async (req,
       return res.status(404).json({ error: 'Manifest not found for user' });
     }
 
-    // B. Download encrypted file chunk from R2
+    // B. Find file metadata (to know original file name & category)
+    let meta = null;
+    if (firebaseDb) {
+      const snap = await firebaseDb.ref(`users/${userKey}/files/${itemId}`).once('value');
+      if (snap.exists()) meta = snap.val();
+    }
+
+    const originalFileName = meta?.fileName || `${itemId}.bin`;
+    const mimeType = getMimeType(originalFileName);
+
+    // Fetch encrypted buffer from R2 or local storage
+    let encryptedBuffer = null;
+
     if (r2Client) {
-      const categories = ['Photos', 'Videos', 'Audio', 'Documents', 'Archives', 'General'];
+      const categories = [meta?.category, 'Photos', 'Videos', 'Audio', 'Documents', 'Archives', 'General'].filter(Boolean);
       for (const cat of categories) {
         const keyToTry = `${APP_PACKAGE_NAME}/${userKey}/${cat}/${itemId}.enc`;
         try {
@@ -1145,20 +1247,50 @@ app.get('/api/admin/user/:userKey/recover/:itemId', verifyAdminAuth, async (req,
             Bucket: R2_BUCKET_NAME,
             Key: keyToTry
           }));
-          res.setHeader('Content-Disposition', `attachment; filename="${itemId}.enc"`);
-          res.setHeader('Content-Type', 'application/octet-stream');
-          return r2Res.Body.pipe(res);
+          const chunks = [];
+          for await (const chunk of r2Res.Body) chunks.push(chunk);
+          encryptedBuffer = Buffer.concat(chunks);
+          break;
         } catch (_) {}
       }
     }
 
-    // C. Check local storage
-    const localFile = findLocalFile(userKey, itemId);
-    if (localFile && fs.existsSync(localFile)) {
-      return res.download(localFile, `${itemId}.enc`);
+    if (!encryptedBuffer) {
+      const localFile = findLocalFile(userKey, itemId);
+      if (localFile && fs.existsSync(localFile)) {
+        encryptedBuffer = fs.readFileSync(localFile);
+      }
     }
 
-    res.status(404).json({ error: 'Requested file not found in R2 or local storage' });
+    if (!encryptedBuffer) {
+      return res.status(404).json({ error: 'Requested file not found in R2 or local storage' });
+    }
+
+    // C. Deliver based on requested mode (Decrypted vs Encrypted)
+    if (mode === 'encrypted') {
+      res.setHeader('Content-Disposition', `attachment; filename="${itemId}.enc"`);
+      res.setHeader('Content-Type', 'application/octet-stream');
+      return res.send(encryptedBuffer);
+    }
+
+    // Attempt Decryption
+    const vaultKey = await getUserVaultKey(userKey);
+    let outputBuffer = encryptedBuffer;
+    let isDecrypted = false;
+
+    if (vaultKey) {
+      try {
+        outputBuffer = decryptVaultBuffer(encryptedBuffer, vaultKey);
+        isDecrypted = true;
+      } catch (decErr) {
+        console.warn(`Decryption failed for item ${itemId}:`, decErr.message);
+      }
+    }
+
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(originalFileName)}"`);
+    res.setHeader('Content-Type', isDecrypted ? mimeType : 'application/octet-stream');
+    res.setHeader('X-Decrypted', isDecrypted ? 'true' : 'false');
+    return res.send(outputBuffer);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
