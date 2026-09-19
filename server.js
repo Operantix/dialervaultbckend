@@ -1296,6 +1296,168 @@ app.get('/api/admin/user/:userKey/recover/:itemId', verifyAdminAuth, async (req,
   }
 });
 
+// 4. Admin Delete: Delete single file for a user
+app.delete('/api/admin/user/:userKey/file/:itemId', verifyAdminAuth, async (req, res) => {
+  try {
+    const { userKey, itemId } = req.params;
+
+    // Get file size to adjust quota
+    let fileSize = 0;
+    let category = 'General';
+    let fileKey = null;
+
+    if (firebaseDb) {
+      const snap = await firebaseDb.ref(`users/${userKey}/files/${itemId}`).once('value');
+      if (snap.exists()) {
+        const val = snap.val();
+        fileSize = val.fileSizeBytes || 0;
+        category = val.category || 'General';
+        fileKey = cleanFileNameKey(val.fileName);
+      }
+    }
+
+    // A. Delete from Cloudflare R2
+    if (r2Client) {
+      const categories = [category, 'Photos', 'Videos', 'Audio', 'Documents', 'Archives', 'General'];
+      for (const cat of categories) {
+        const keyToTry = `${APP_PACKAGE_NAME}/${userKey}/${cat}/${itemId}.enc`;
+        try {
+          await r2Client.send(new DeleteObjectCommand({
+            Bucket: R2_BUCKET_NAME,
+            Key: keyToTry
+          }));
+        } catch (_) {}
+      }
+    }
+
+    // B. Delete from local storage
+    const localFile = findLocalFile(userKey, itemId);
+    if (localFile && fs.existsSync(localFile)) {
+      try { fs.unlinkSync(localFile); } catch (_) {}
+    }
+
+    // C. Remove from Firebase & decrement quota
+    if (firebaseDb) {
+      await firebaseDb.ref(`users/${userKey}/files/${itemId}`).remove();
+      if (fileKey) {
+        await firebaseDb.ref(`users/${userKey}/${category}/${fileKey}`).remove();
+      }
+      if (fileSize > 0) {
+        const qSnap = await firebaseDb.ref(`users/${userKey}/quota`).once('value');
+        if (qSnap.exists()) {
+          const qVal = qSnap.val();
+          const newUsed = Math.max(0, (qVal.usedBytes || 0) - fileSize);
+          await firebaseDb.ref(`users/${userKey}/quota/usedBytes`).set(newUsed);
+        }
+      }
+    }
+
+    res.json({ success: true, message: `File ${itemId} deleted successfully.` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 5. Admin Delete: Delete ALL files for a user (wipe user vault)
+app.delete('/api/admin/user/:userKey/files', verifyAdminAuth, async (req, res) => {
+  try {
+    const { userKey } = req.params;
+
+    // A. Delete all objects in Cloudflare R2 under user prefix
+    if (r2Client) {
+      try {
+        const userPrefix = `${APP_PACKAGE_NAME}/${userKey}/`;
+        const listRes = await r2Client.send(new ListObjectsV2Command({
+          Bucket: R2_BUCKET_NAME,
+          Prefix: userPrefix
+        }));
+
+        if (listRes.Contents && listRes.Contents.length > 0) {
+          for (const obj of listRes.Contents) {
+            await r2Client.send(new DeleteObjectCommand({
+              Bucket: R2_BUCKET_NAME,
+              Key: obj.Key
+            }));
+          }
+        }
+      } catch (r2Err) {
+        console.warn(`R2 wipe notice for ${userKey}:`, r2Err.message);
+      }
+    }
+
+    // B. Delete local user directory
+    const userDir = path.join(STORAGE_ROOT, APP_PACKAGE_NAME, userKey);
+    if (fs.existsSync(userDir)) {
+      try { fs.rmSync(userDir, { recursive: true, force: true }); } catch (_) {}
+    }
+
+    // C. Clear files & reset quota in Firebase
+    if (firebaseDb) {
+      await firebaseDb.ref(`users/${userKey}/files`).remove();
+      await firebaseDb.ref(`users/${userKey}/manifest`).remove();
+      await firebaseDb.ref(`users/${userKey}/Photos`).remove();
+      await firebaseDb.ref(`users/${userKey}/Videos`).remove();
+      await firebaseDb.ref(`users/${userKey}/Audio`).remove();
+      await firebaseDb.ref(`users/${userKey}/Documents`).remove();
+      await firebaseDb.ref(`users/${userKey}/Archives`).remove();
+      await firebaseDb.ref(`users/${userKey}/General`).remove();
+      await firebaseDb.ref(`users/${userKey}/quota/usedBytes`).set(0);
+    }
+
+    res.json({ success: true, message: `All files wiped successfully for user ${userKey}.` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 6. Admin Delete: Delete user completely (account + all data)
+app.delete('/api/admin/user/:userKey', verifyAdminAuth, async (req, res) => {
+  try {
+    const { userKey } = req.params;
+
+    // A. Delete all R2 objects under user prefix
+    if (r2Client) {
+      try {
+        const userPrefix = `${APP_PACKAGE_NAME}/${userKey}/`;
+        const listRes = await r2Client.send(new ListObjectsV2Command({
+          Bucket: R2_BUCKET_NAME,
+          Prefix: userPrefix
+        }));
+
+        if (listRes.Contents && listRes.Contents.length > 0) {
+          for (const obj of listRes.Contents) {
+            await r2Client.send(new DeleteObjectCommand({
+              Bucket: R2_BUCKET_NAME,
+              Key: obj.Key
+            }));
+          }
+        }
+      } catch (r2Err) {
+        console.warn(`R2 delete notice for ${userKey}:`, r2Err.message);
+      }
+    }
+
+    // B. Delete local user directory
+    const userDir = path.join(STORAGE_ROOT, APP_PACKAGE_NAME, userKey);
+    if (fs.existsSync(userDir)) {
+      try { fs.rmSync(userDir, { recursive: true, force: true }); } catch (_) {}
+    }
+
+    // C. Remove entire user record from Firebase
+    if (firebaseDb) {
+      await firebaseDb.ref(`users/${userKey}`).remove();
+    }
+
+    // Remove from localDb fallback
+    delete localDb.users[userKey];
+    delete localDb.files[userKey];
+
+    res.json({ success: true, message: `User ${userKey} and all associated data permanently deleted.` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(port, () => {
   console.log(`🚀 DialerVault Central Cloud Backend running on port ${port}`);
 });
