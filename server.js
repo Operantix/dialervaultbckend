@@ -19,28 +19,37 @@ if (!fs.existsSync(STORAGE_ROOT)) {
 }
 
 function getLocalUserPath(email, category) {
-  const userName = email.includes('@') ? email.split('@')[0].trim() : email.trim();
-  const dir = path.join(STORAGE_ROOT, APP_PACKAGE_NAME, userName, category || 'General');
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+  const rawUserName = email.includes('@') ? email.split('@')[0].trim() : email.trim();
+  const userName = rawUserName.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const safeCategory = (category || 'General').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+  const dir = path.join(STORAGE_ROOT, APP_PACKAGE_NAME, userName, safeCategory);
+  const resolved = path.resolve(dir);
+  if (!resolved.startsWith(path.resolve(STORAGE_ROOT))) {
+    throw new Error('Invalid path traversal detected');
   }
-  return dir;
+  if (!fs.existsSync(resolved)) {
+    fs.mkdirSync(resolved, { recursive: true });
+  }
+  return resolved;
 }
 
 function findLocalFile(email, itemId) {
-  const userName = email.includes('@') ? email.split('@')[0].trim() : email.trim();
+  const rawUserName = email.includes('@') ? email.split('@')[0].trim() : email.trim();
+  const userName = rawUserName.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const safeItemId = String(itemId).replace(/[^a-zA-Z0-9_-]/g, '_');
   const userDir = path.join(STORAGE_ROOT, APP_PACKAGE_NAME, userName);
-  if (!fs.existsSync(userDir)) return null;
+  const resolvedUserDir = path.resolve(userDir);
+  if (!resolvedUserDir.startsWith(path.resolve(STORAGE_ROOT)) || !fs.existsSync(resolvedUserDir)) return null;
 
   // Search user root and category subfolders
-  const targetName = `${itemId}.enc`;
-  const rootFile = path.join(userDir, targetName);
+  const targetName = `${safeItemId}.enc`;
+  const rootFile = path.join(resolvedUserDir, targetName);
   if (fs.existsSync(rootFile)) return rootFile;
 
-  const entries = fs.readdirSync(userDir, { withFileTypes: true });
+  const entries = fs.readdirSync(resolvedUserDir, { withFileTypes: true });
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      const subFile = path.join(userDir, entry.name, targetName);
+      const subFile = path.join(resolvedUserDir, entry.name, targetName);
       if (fs.existsSync(subFile)) return subFile;
     }
   }
@@ -74,7 +83,31 @@ let drive = null;
 
 function initGoogleDrive() {
   try {
-    // 1. Prioritize OAuth2 if Refresh Token exists (Uses personal 15 GB quota, bypassing Service Account 0-quota limit)
+    let serviceAccountCreds = null;
+    if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+      serviceAccountCreds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+    } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+      serviceAccountCreds = require(process.env.GOOGLE_APPLICATION_CREDENTIALS);
+    } else {
+      try {
+        serviceAccountCreds = require('./google-service-account.json');
+      } catch (ignored) {}
+    }
+
+    const initServiceAccount = () => {
+      if (serviceAccountCreds) {
+        const auth = new google.auth.GoogleAuth({
+          credentials: serviceAccountCreds,
+          scopes: ['https://www.googleapis.com/auth/drive']
+        });
+        drive = google.drive({ version: 'v3', auth });
+        console.log('✅ Google Drive Service Account authenticated');
+        return true;
+      }
+      return false;
+    };
+
+    // 1. Check if OAuth2 credentials exist
     if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && process.env.GOOGLE_REFRESH_TOKEN) {
       const oauth2Client = new google.auth.OAuth2(
         process.env.GOOGLE_CLIENT_ID,
@@ -84,31 +117,28 @@ function initGoogleDrive() {
       oauth2Client.setCredentials({
         refresh_token: process.env.GOOGLE_REFRESH_TOKEN
       });
-      drive = google.drive({ version: 'v3', auth: oauth2Client });
-      console.log('✅ Google Drive OAuth2 authenticated (Personal Drive quota active)');
+      const testDrive = google.drive({ version: 'v3', auth: oauth2Client });
+      
+      // Asynchronously verify OAuth2 refresh token. If it fails with invalid_grant, switch immediately to Service Account!
+      testDrive.files.list({ pageSize: 1, fields: 'files(id)' })
+        .then(() => {
+          drive = testDrive;
+          console.log('✅ Google Drive OAuth2 verified and active (Personal Drive quota active)');
+        })
+        .catch((oauthErr) => {
+          console.warn(`⚠️ Google Drive OAuth2 failed (${oauthErr.message}). Falling back to Service Account...`);
+          if (!initServiceAccount()) {
+            console.error('❌ Service Account fallback failed: credentials missing.');
+          }
+        });
+
+      // Temporarily assign testDrive or Service Account while verification completes
+      drive = testDrive;
       return;
     }
 
-    // 2. Fallback to Service Account
-    let credentials = null;
-    if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-      credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-    } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-      credentials = require(process.env.GOOGLE_APPLICATION_CREDENTIALS);
-    } else {
-      try {
-        credentials = require('./google-service-account.json');
-      } catch (ignored) {}
-    }
-
-    if (credentials) {
-      const auth = new google.auth.GoogleAuth({
-        credentials,
-        scopes: ['https://www.googleapis.com/auth/drive']
-      });
-      drive = google.drive({ version: 'v3', auth });
-      console.log('✅ Google Drive Service Account authenticated');
-    } else {
+    // 2. Fallback to Service Account directly
+    if (!initServiceAccount()) {
       console.warn('⚠️ GOOGLE_SERVICE_ACCOUNT_JSON / OAuth2 credentials missing. Running in simulation mode.');
     }
   } catch (err) {
@@ -194,7 +224,9 @@ async function getOrCreateDriveFolder(parentFolderId, folderName) {
       const res = await drive.files.list({
         q: query,
         fields: 'files(id, name)',
-        spaces: 'drive'
+        spaces: 'drive',
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true
       });
 
       if (res.data.files && res.data.files.length > 0) {
@@ -210,7 +242,8 @@ async function getOrCreateDriveFolder(parentFolderId, folderName) {
           mimeType: 'application/vnd.google-apps.folder',
           parents: [parentFolderId]
         },
-        fields: 'id'
+        fields: 'id',
+        supportsAllDrives: true
       });
 
       const newId = createRes.data.id;
@@ -493,24 +526,73 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
         driveWebViewLink = driveRes.data.webViewLink || `https://drive.google.com/file/d/${driveFileId}/view?usp=drivesdk`;
         driveDownloadLink = driveRes.data.webContentLink || `https://drive.google.com/uc?id=${driveFileId}&export=download`;
 
-        // Grant read permission asynchronously in background (eliminates blocking latency)
-        drive.permissions.create({
-          fileId: driveFileId,
-          requestBody: {
-            role: 'reader',
-            type: 'anyone'
-          },
-          supportsAllDrives: true
-        }).catch((_permErr) => {});
-
-        console.log(`✅ [Uploaded to Drive] '${safeFileName}' (${itemId}.enc) -> ID: ${driveFileId}, Link: ${driveWebViewLink}`);
+        // Cloud backups remain strictly private to the authenticated account
+        console.log(`✅ [Uploaded to Drive] '${safeFileName}' (${itemId}.enc) -> ID: ${driveFileId}`);
       }
     } catch (driveErr) {
       console.error(`❌ [Google Drive Backup Failed] '${safeFileName}':`, driveErr.message);
-      return res.status(502).json({
-        success: false,
-        error: `Google Drive backup failed (${driveErr.message}). Details were NOT saved to Firebase because Drive backup is required first.`
-      });
+
+      // If OAuth failed with invalid_grant or auth error, automatically attempt fallback to Service Account!
+      if (driveErr.message && (driveErr.message.includes('invalid_grant') || driveErr.message.includes('auth') || driveErr.message.includes('token') || driveErr.message.includes('credentials'))) {
+        try {
+          let serviceAccountCreds = null;
+          if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+            serviceAccountCreds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+          } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+            serviceAccountCreds = require(process.env.GOOGLE_APPLICATION_CREDENTIALS);
+          } else {
+            try { serviceAccountCreds = require('./google-service-account.json'); } catch (_) {}
+          }
+
+          if (serviceAccountCreds) {
+            console.log('🔄 Retrying Google Drive upload with Service Account fallback...');
+            const auth = new google.auth.GoogleAuth({
+              credentials: serviceAccountCreds,
+              scopes: ['https://www.googleapis.com/auth/drive']
+            });
+            drive = google.drive({ version: 'v3', auth });
+
+            const targetFolderId = await resolveUserCategoryFolder(email, safeCategory);
+            let retryMediaBody;
+            if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
+              retryMediaBody = fs.createReadStream(uploadedFilePath);
+            } else if (req.file?.buffer) {
+              const bufferStream = new stream.PassThrough();
+              bufferStream.end(req.file.buffer);
+              retryMediaBody = bufferStream;
+            }
+
+            const retryDriveRes = await drive.files.create({
+              requestBody: {
+                name: `${itemId}.enc`,
+                mimeType: 'application/octet-stream',
+                parents: targetFolderId ? [targetFolderId] : undefined,
+                description: `DialerVault Backup: ${safeFileName} (${safeCategory})`
+              },
+              media: {
+                mimeType: 'application/octet-stream',
+                body: retryMediaBody
+              },
+              fields: 'id, name, webViewLink, webContentLink, size, mimeType',
+              supportsAllDrives: true
+            });
+
+            driveFileId = retryDriveRes.data.id;
+            driveWebViewLink = retryDriveRes.data.webViewLink || `https://drive.google.com/file/d/${driveFileId}/view?usp=drivesdk`;
+            driveDownloadLink = retryDriveRes.data.webContentLink || `https://drive.google.com/uc?id=${driveFileId}&export=download`;
+            console.log(`✅ [Service Account Retry Succeeded] '${safeFileName}' -> ID: ${driveFileId}`);
+          }
+        } catch (retryErr) {
+          console.error(`❌ [Service Account Retry Also Failed]:`, retryErr.message);
+        }
+      }
+
+      if (!driveFileId) {
+        return res.status(502).json({
+          success: false,
+          error: `Google Drive backup failed (${driveErr.message}). Details were NOT saved to Firebase because Drive backup is required first.`
+        });
+      }
     }
 
     if (!driveFileId) {
@@ -811,10 +893,36 @@ app.get('/api/backup/manifest', async (req, res) => {
     // 3. Fallback: Query Google Drive
     if (drive) {
       const rootId = process.env.GOOGLE_DRIVE_FOLDER_ID;
-      const userFolderId = await getOrCreateDriveFolder(rootId, email.trim().toLowerCase());
+      const appPackageFolderId = await getOrCreateDriveFolder(rootId, APP_PACKAGE_NAME);
+      const parentForUser = appPackageFolderId || rootId;
+      const userNameFolder = getUserName(email);
+      const userFolderId = await getOrCreateDriveFolder(parentForUser, userNameFolder);
+      const targetParent = userFolderId || rootId;
 
-      const q = `'${userFolderId}' in parents and name = 'vault_index.json' and trashed = false`;
-      const list = await drive.files.list({ q, fields: 'files(id, name)', supportsAllDrives: true });
+      // Search in target user folder first
+      let q = `'${targetParent}' in parents and name = 'vault_index.json' and trashed = false`;
+      let list = await drive.files.list({
+        q,
+        fields: 'files(id, name)',
+        spaces: 'drive',
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true
+      });
+
+      // If not found, try legacy query in root or any parent matching email/username
+      if (!list.data.files || list.data.files.length === 0) {
+        const legacyUserFolderId = await getOrCreateDriveFolder(rootId, email.trim().toLowerCase());
+        if (legacyUserFolderId && legacyUserFolderId !== targetParent) {
+          q = `'${legacyUserFolderId}' in parents and name = 'vault_index.json' and trashed = false`;
+          list = await drive.files.list({
+            q,
+            fields: 'files(id, name)',
+            spaces: 'drive',
+            supportsAllDrives: true,
+            includeItemsFromAllDrives: true
+          });
+        }
+      }
 
       if (list.data.files && list.data.files.length > 0) {
         const fileId = list.data.files[0].id;
@@ -836,18 +944,31 @@ app.get('/api/backup/manifest', async (req, res) => {
 app.get('/api/backup/download', async (req, res) => {
   try {
     const { email, itemId } = req.query;
+    let driveFileId = req.query.driveFileId;
     if (!email || !itemId) return res.status(400).json({ error: 'Missing email or itemId' });
 
-    // 1. Check local server vault storage first
+    // 1. If driveFileId was directly provided by client and is valid, stream it immediately
+    if (drive && driveFileId && driveFileId !== 'local_vault_storage' && driveFileId !== 'simulated_id' && driveFileId.trim() !== '') {
+      try {
+        const driveStream = await drive.files.get(
+          { fileId: driveFileId.trim(), alt: 'media', supportsAllDrives: true },
+          { responseType: 'stream' }
+        );
+        return driveStream.data.pipe(res);
+      } catch (dErr) {
+        console.warn(`Direct driveFileId stream failed (${driveFileId}): ${dErr.message}`);
+      }
+    }
+
+    // 2. Check local server vault storage first
     const localFile = findLocalFile(email, itemId);
     if (localFile && fs.existsSync(localFile)) {
       return res.sendFile(localFile);
     }
 
     const key = cleanEmailKey(email);
-    let driveFileId = null;
 
-    // 2. Look up driveFileId from Firebase metadata
+    // 3. Look up driveFileId from Firebase metadata if not provided or direct stream failed
     if (firebaseDb) {
       const userName = getUserName(email);
       let snap = await firebaseDb.ref(`users/${userName}/files/${itemId}`).once('value');
@@ -859,27 +980,32 @@ app.get('/api/backup/download', async (req, res) => {
       }
     }
 
-    // 3. Stream directly from Google Drive if available
-    if (drive && driveFileId && driveFileId !== 'local_vault_storage' && driveFileId !== 'simulated_id') {
+    // 4. Stream directly from Google Drive if driveFileId obtained from Firebase
+    if (drive && driveFileId && driveFileId !== 'local_vault_storage' && driveFileId !== 'simulated_id' && driveFileId.trim() !== '') {
       try {
         const driveStream = await drive.files.get(
-          { fileId: driveFileId, alt: 'media', supportsAllDrives: true },
+          { fileId: driveFileId.trim(), alt: 'media', supportsAllDrives: true },
           { responseType: 'stream' }
         );
         return driveStream.data.pipe(res);
       } catch (dErr) {
-        console.warn(`Drive download stream failed: ${dErr.message}`);
+        console.warn(`Drive download stream from Firebase ID failed: ${dErr.message}`);
       }
     }
 
-    // 3. Fallback search by filename in Drive
+    // 5. Fallback search by filename in Drive across all drives
     if (drive) {
       const q = `name = '${itemId}.enc' and trashed = false`;
-      const list = await drive.files.list({ q, fields: 'files(id, name)' });
+      const list = await drive.files.list({
+        q,
+        fields: 'files(id, name)',
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true
+      });
       if (list.data.files && list.data.files.length > 0) {
         const fileId = list.data.files[0].id;
         const driveStream = await drive.files.get(
-          { fileId, alt: 'media' },
+          { fileId, alt: 'media', supportsAllDrives: true },
           { responseType: 'stream' }
         );
         return driveStream.data.pipe(res);
@@ -1129,9 +1255,15 @@ app.post('/api/payment/verify', async (req, res) => {
   }
 });
 
-// Direct upgrade / extend endpoint
+// Direct upgrade / extend endpoint (requires ADMIN_SECRET_KEY)
 app.post('/api/upgrade/activate', async (req, res) => {
   try {
+    const adminKey = req.headers['x-admin-key'] || req.headers['authorization'];
+    const expectedKey = process.env.ADMIN_SECRET_KEY;
+    if (!expectedKey || (adminKey !== `Bearer ${expectedKey}` && adminKey !== expectedKey)) {
+      return res.status(401).json({ error: 'Unauthorized: Valid Admin API key required for manual quota upgrades' });
+    }
+
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email required' });
 
