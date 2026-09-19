@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DialerVault Admin Control Center</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="top-header">
+      <div class="header-left">
+        <div class="logo-shield">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            <path d="M12 8v4"/>
+            <path d="M12 16h.01"/>
+          </svg>
+        </div>
+        <div>
+          <h1>DialerVault <span class="badge-admin">ADMIN CONTROL</span></h1>
+          <p class="subtitle">Cloudflare R2 Storage &amp; User Security Activity Monitor</p>
+        </div>
+      </div>
+      <div class="header-right">
+        <div class="server-status">
+          <span class="status-dot online"></span>
+          <span id="serverStatusText">Connecting...</span>
+        </div>
+        <button id="btnRefresh" class="btn-icon" title="Refresh Users">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M23 4v6h-6"/>
+            <path d="M1 20v-6h6"/>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Config Bar -->
+    <div class="config-bar">
+      <div class="input-group">
+        <label for="serverUrl">Backend URL:</label>
+        <input type="text" id="serverUrl" value="https://dialervaultbckend-production.up.railway.app" placeholder="https://your-backend.up.railway.app">
+      </div>
+      <div class="input-group">
+        <label for="adminKey">Admin Secret Key:</label>
+        <input type="password" id="adminKey" value="dialervault_admin_secret_2026" placeholder="Admin Secret Key">
+      </div>
+      <button id="btnSaveConfig" class="btn-primary">Connect</button>
+    </div>
+
+    <!-- Quick Stats Cards -->
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-icon">👥</div>
+        <div class="stat-info">
+          <span class="stat-label">Total Users</span>
+          <span id="statTotalUsers" class="stat-val">0</span>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon">📦</div>
+        <div class="stat-info">
+          <span class="stat-label">Total Vault Files</span>
+          <span id="statTotalFiles" class="stat-val">0</span>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon">☁️</div>
+        <div class="stat-info">
+          <span class="stat-label">Total R2 Cloud Storage</span>
+          <span id="statTotalStorage" class="stat-val">0 MB</span>
+        </div>
+      </div>
+      <div class="stat-card alert-card">
+        <div class="stat-icon">⚠️</div>
+        <div class="stat-info">
+          <span class="stat-label">Unusual Activities</span>
+          <span id="statUnusual" class="stat-val">0</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main Content: Users List -->
+    <main class="content-section">
+      <div class="section-header">
+        <h2>Registered Users</h2>
+        <div class="search-bar">
+          <input type="text" id="userSearch" placeholder="Search by email or user handle...">
+        </div>
+      </div>
+
+      <div class="table-container">
+        <table class="users-table">
+          <thead>
+            <tr>
+              <th>User / Email</th>
+              <th>Status / Activity</th>
+              <th>Total Files</th>
+              <th>Quota Used</th>
+              <th>Storage Tier</th>
+              <th>Last Backup</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="usersTableBody">
+            <tr>
+              <td colspan="7" class="loading-cell">Loading users from central server...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </main>
+
+    <!-- Modal: User Files & Disaster Recovery -->
+    <div id="userFilesModal" class="modal-overlay hidden">
+      <div class="modal-dialog">
+        <div class="modal-header">
+          <div>
+            <h3 id="modalUserName">User Files</h3>
+            <p id="modalUserEmail" class="modal-sub"></p>
+          </div>
+          <button id="btnCloseModal" class="btn-close">&times;</button>
+        </div>
+
+        <div class="modal-body">
+          <div class="modal-action-bar">
+            <div class="modal-stats">
+              <span id="modalFileCount">0 files</span> • <span id="modalTotalSize">0 MB</span>
+            </div>
+            <button id="btnRecoverManifest" class="btn-recover">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="7 10 12 15 17 10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              Recover Manifest to Admin
+            </button>
+          </div>
+
+          <div class="files-list-container">
+            <table class="files-table">
+              <thead>
+                <tr>
+                  <th>Category</th>
+                  <th>File Name</th>
+                  <th>Size</th>
+                  <th>Uploaded</th>
+                  <th>Recovery</th>
+                </tr>
+              </thead>
+              <tbody id="filesTableBody">
+                <tr>
+                  <td colspan="5" class="loading-cell">Loading files...</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

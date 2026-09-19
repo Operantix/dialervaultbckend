@@ -58,6 +58,15 @@ function findLocalFile(email, itemId) {
 app.use(cors());
 app.use(express.json());
 
+// Serve Admin Application Dashboard
+const localAdminDir = path.join(__dirname, 'public-admin');
+const rootAdminDir = path.join(__dirname, '..', 'admin-application');
+if (fs.existsSync(localAdminDir)) {
+  app.use('/admin', express.static(localAdminDir));
+} else if (fs.existsSync(rootAdminDir)) {
+  app.use('/admin', express.static(rootAdminDir));
+}
+
 // Disk-based multer storage for high-speed streaming of large files (up to 500MB) without memory pressure
 const uploadTempDir = path.join(STORAGE_ROOT, 'temp_uploads');
 if (!fs.existsSync(uploadTempDir)) {
