@@ -265,7 +265,7 @@ function renderUsers() {
         <td><span class="badge-tag ${tagClass}">${tagText}</span></td>
         <td><strong>${u.totalFiles}</strong> files</td>
         <td>${formatBytes(u.usedBytes)}</td>
-        <td>${u.isLifetime100GB ? '⭐️ 100 GB Lifetime' : 'Free Tier (1 GB)'}</td>
+        <td>${u.isLifetime100GB ? '⭐️ 100 GB Lifetime' : 'Free Tier (10 GB)'}</td>
         <td>${formatDate(u.lastBackupTime)}</td>
         <td>
           <div style="display: flex; gap: 8px;">

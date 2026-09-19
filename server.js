@@ -136,7 +136,7 @@ const localDb = {
   files: {}
 };
 
-const FREE_LIMIT = 1073741824; // 1.0 GB
+const FREE_LIMIT = 10737418240; // 10.0 GB
 const LIFETIME_LIMIT = 107374182400; // 100 GB
 
 // Helper: Sanitize email for database and key names
@@ -239,7 +239,7 @@ app.get('/api/backup/quota', async (req, res) => {
     limitBytes: userQuota.limitBytes || (userQuota.isLifetime100GB ? LIFETIME_LIMIT : FREE_LIMIT),
     isLifetime100GB: !!userQuota.isLifetime100GB,
     purchased_packs: userQuota.purchased_packs || (userQuota.isLifetime100GB ? 1 : 0),
-    total_gb: userQuota.total_gb || (userQuota.isLifetime100GB ? 100 : 1)
+    total_gb: userQuota.total_gb || (userQuota.isLifetime100GB ? 100 : 10)
   });
 });
 
