@@ -78,189 +78,52 @@ const upload = multer({
   limits: { fileSize: 500 * 1024 * 1024 } // 500MB per file chunk
 });
 
-// 1. Initialize Google Drive API Client (Supports OAuth2 for Personal Drive or Service Account)
-let drive = null;
+const {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  DeleteObjectCommand,
+  ListObjectsV2Command,
+  HeadObjectCommand
+} = require('@aws-sdk/client-s3');
 
-function initGoogleDrive() {
+// 1. Initialize Cloudflare R2 Object Storage (S3-compatible API)
+let r2Client = null;
+const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME || 'dialervault-backups';
+const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || '';
+const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || '';
+
+function initR2() {
   try {
-    let serviceAccountCreds = null;
-    if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-      serviceAccountCreds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-    } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-      serviceAccountCreds = require(process.env.GOOGLE_APPLICATION_CREDENTIALS);
-    } else {
-      try {
-        serviceAccountCreds = require('./google-service-account.json');
-      } catch (ignored) {}
-    }
+    const accessKeyId = process.env.R2_ACCESS_KEY_ID;
+    const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
+    const accountId = process.env.R2_ACCOUNT_ID;
 
-    const initServiceAccount = () => {
-      if (serviceAccountCreds) {
-        const auth = new google.auth.GoogleAuth({
-          credentials: serviceAccountCreds,
-          scopes: ['https://www.googleapis.com/auth/drive']
-        });
-        drive = google.drive({ version: 'v3', auth });
-        console.log('✅ Google Drive Service Account authenticated');
-        return true;
-      }
-      return false;
-    };
-
-    // 1. Check if OAuth2 credentials exist
-    if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && process.env.GOOGLE_REFRESH_TOKEN) {
-      const oauth2Client = new google.auth.OAuth2(
-        process.env.GOOGLE_CLIENT_ID,
-        process.env.GOOGLE_CLIENT_SECRET,
-        'https://developers.google.com/oauthplayground'
-      );
-      oauth2Client.setCredentials({
-        refresh_token: process.env.GOOGLE_REFRESH_TOKEN
+    if (accessKeyId && secretAccessKey && accountId) {
+      r2Client = new S3Client({
+        region: 'auto',
+        endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+        credentials: {
+          accessKeyId,
+          secretAccessKey
+        }
       });
-      const testDrive = google.drive({ version: 'v3', auth: oauth2Client });
-      
-      // Asynchronously verify OAuth2 refresh token. If it fails with invalid_grant, switch immediately to Service Account!
-      testDrive.files.list({ pageSize: 1, fields: 'files(id)' })
-        .then(() => {
-          drive = testDrive;
-          console.log('✅ Google Drive OAuth2 verified and active (Personal Drive quota active)');
-        })
-        .catch((oauthErr) => {
-          console.warn(`⚠️ Google Drive OAuth2 failed (${oauthErr.message}). Falling back to Service Account...`);
-          if (!initServiceAccount()) {
-            console.error('❌ Service Account fallback failed: credentials missing.');
-          }
-        });
-
-      // Temporarily assign testDrive or Service Account while verification completes
-      drive = testDrive;
-      return;
-    }
-
-    // 2. Fallback to Service Account directly
-    if (!initServiceAccount()) {
-      console.warn('⚠️ GOOGLE_SERVICE_ACCOUNT_JSON / OAuth2 credentials missing. Running in simulation mode.');
+      console.log('✅ Cloudflare R2 Object Storage connected and active');
+    } else {
+      console.warn('⚠️ Cloudflare R2 credentials missing (R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID). Fallback to local vault storage active.');
     }
   } catch (err) {
-    console.error('❌ Google Drive Auth Error:', err.message);
+    console.error('❌ Cloudflare R2 Init Error:', err.message);
   }
 }
 
-initGoogleDrive();
+initR2();
 
-// 2. Initialize Firebase Admin (for Realtime Database / Firestore)
-let firebaseDb = null;
-
-function initFirebase() {
-  try {
-    let serviceAccount = null;
-    if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-    } else if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
-      serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH);
-    } else {
-      try {
-        serviceAccount = require('./firebase-service-account.json');
-      } catch (ignored) {}
-    }
-
-    const databaseURL = process.env.FIREBASE_DATABASE_URL;
-
-    if (serviceAccount && databaseURL) {
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-        databaseURL
-      });
-      firebaseDb = admin.database();
-      console.log('✅ Firebase Realtime Database connected');
-    } else if (databaseURL) {
-      console.log('ℹ️ Firebase Database URL present. Metadata will sync via REST.');
-    } else {
-      console.warn('ℹ️ Firebase credentials not provided. Using in-memory fallback.');
-    }
-  } catch (err) {
-    console.error('❌ Firebase Init Error:', err.message);
-  }
-}
-
-initFirebase();
-
-// Fallback in-memory metadata store
-const localDb = {
-  users: {},
-  files: {}
-};
-
-const FREE_LIMIT = 1073741824; // 1.0 GB
-const LIFETIME_LIMIT = 107374182400; // 100 GB
-
-// Cache for created Drive folder IDs so we don't query Drive every upload
-const folderIdCache = new Map();
-const folderPromiseCache = new Map();
-
-// Helper: Sanitize email for folder and key names
-function cleanEmailKey(email) {
-  return email.trim().toLowerCase().replace(/[.#$\[\]]/g, '_');
-}
-
-/**
- * Ensures a directory path exists in Google Drive:
- * DialerVault_Central_Backups -> user@email.com -> category (e.g. Photos)
- */
-async function getOrCreateDriveFolder(parentFolderId, folderName) {
-  const cacheKey = `${parentFolderId}_${folderName}`;
-  if (folderIdCache.has(cacheKey)) {
-    return folderIdCache.get(cacheKey);
-  }
-  if (folderPromiseCache.has(cacheKey)) {
-    return await folderPromiseCache.get(cacheKey);
-  }
-
-  if (!drive) return null;
-
-  const folderPromise = (async () => {
-    try {
-      const query = `'${parentFolderId}' in parents and name = '${folderName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
-      const res = await drive.files.list({
-        q: query,
-        fields: 'files(id, name)',
-        spaces: 'drive',
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true
-      });
-
-      if (res.data.files && res.data.files.length > 0) {
-        const folderId = res.data.files[0].id;
-        folderIdCache.set(cacheKey, folderId);
-        return folderId;
-      }
-
-      // Create new folder
-      const createRes = await drive.files.create({
-        requestBody: {
-          name: folderName,
-          mimeType: 'application/vnd.google-apps.folder',
-          parents: [parentFolderId]
-        },
-        fields: 'id',
-        supportsAllDrives: true
-      });
-
-      const newId = createRes.data.id;
-      folderIdCache.set(cacheKey, newId);
-      return newId;
-    } catch (err) {
-      console.error(`Error managing folder ${folderName}:`, err.message);
-      return null;
-    }
-  })();
-
-  folderPromiseCache.set(cacheKey, folderPromise);
-  try {
-    return await folderPromise;
-  } finally {
-    folderPromiseCache.delete(cacheKey);
-  }
+// Helper to construct S3 / R2 object key
+function getR2ObjectKey(email, category, fileName) {
+  const userName = getUserName(email);
+  const safeCategory = (category || 'General').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+  return `${APP_PACKAGE_NAME}/${userName}/${safeCategory}/${fileName}`;
 }
 
 const APP_PACKAGE_NAME = process.env.APP_PACKAGE_NAME || 'com.operantix.dialervault';
@@ -295,10 +158,10 @@ async function resolveUserCategoryFolder(email, category) {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    service: 'DialerVault Central Cloud Storage',
-    googleDriveReady: !!drive,
+    service: 'DialerVault Cloudflare R2 Central Cloud Storage',
+    r2Ready: !!r2Client,
     firebaseReady: !!firebaseDb,
-    version: '1.2.3'
+    version: '1.4.0'
   });
 });
 
@@ -306,7 +169,8 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'healthy',
     online: true,
-    version: '1.2.3',
+    storage: r2Client ? 'Cloudflare R2 Object Storage' : 'Local Vault Fallback',
+    version: '1.4.0',
     timestamp: Date.now()
   });
 });
@@ -358,7 +222,7 @@ function cleanFileNameKey(name) {
   return name.trim().replace(/[.#$\[\]/]/g, '_');
 }
 
-// Upload encrypted file chunk
+// Upload encrypted file chunk to Cloudflare R2
 app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
   const uploadedFilePath = req.file?.path;
   try {
@@ -378,64 +242,39 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
     // Check user quota in Firebase / localDb
     let userQuota = { usedBytes: 0, isLifetime100GB: false };
     let alreadySynced = false;
-    let existingDriveId = null;
-    let existingDriveLink = null;
-    let existingDownloadLink = null;
+    let existingR2Key = null;
 
     if (firebaseDb) {
       const snap = await firebaseDb.ref(`users/${userName}/quota`).once('value');
       if (snap.exists()) userQuota = snap.val();
 
-      // Check 1: Does this file name already exist in users/<username>/<category>/<fileName>?
-      const byNameSnap = await firebaseDb.ref(`users/${userName}/${safeCategory}/${fileKey}`).once('value');
-      if (byNameSnap.exists()) {
-        const val = byNameSnap.val();
-        if (val.backedUpToDrive && val.driveFileId && val.driveFileId !== 'local_vault_storage') {
+      const byIdSnap = await firebaseDb.ref(`users/${userName}/files/${itemId}`).once('value');
+      if (byIdSnap.exists()) {
+        const val = byIdSnap.val();
+        if (val.backedUpToR2 || val.r2Key) {
           alreadySynced = true;
-          existingDriveId = val.driveFileId;
-          existingDriveLink = val.driveLink || val.webViewLink;
-          existingDownloadLink = val.downloadLink;
-        }
-      }
-
-      // Check 2: Does this itemId already exist in users/<username>/files/<itemId>?
-      if (!alreadySynced) {
-        const byIdSnap = await firebaseDb.ref(`users/${userName}/files/${itemId}`).once('value');
-        if (byIdSnap.exists()) {
-          const val = byIdSnap.val();
-          if (val.backedUpToDrive && val.driveFileId && val.driveFileId !== 'local_vault_storage') {
-            alreadySynced = true;
-            existingDriveId = val.driveFileId;
-            existingDriveLink = val.driveLink || val.webViewLink;
-            existingDownloadLink = val.downloadLink;
-          }
+          existingR2Key = val.r2Key || val.driveFileId;
         }
       }
     } else {
       userQuota = localDb.users[userName] || userQuota;
-      if (localDb.files[userName] && localDb.files[userName][itemId] && localDb.files[userName][itemId].backedUpToDrive) {
+      if (localDb.files[userName] && localDb.files[userName][itemId] && localDb.files[userName][itemId].backedUpToR2) {
         alreadySynced = true;
-        existingDriveId = localDb.files[userName][itemId].driveFileId;
-        existingDriveLink = localDb.files[userName][itemId].driveLink;
-        existingDownloadLink = localDb.files[userName][itemId].downloadLink;
+        existingR2Key = localDb.files[userName][itemId].r2Key;
       }
     }
 
-    // If ALREADY SYNCED in Google Drive & Firebase, return confirmed links
-    if (alreadySynced && existingDriveId) {
-      console.log(`ℹ️ [Firebase Sync Skip] '${safeFileName}' (${itemId}) is already backed up to Drive (ID: ${existingDriveId}) and recorded in Firebase. Skipping.`);
+    if (alreadySynced && existingR2Key) {
       return res.json({
         success: true,
         itemId,
         fileName: safeFileName,
-        driveFileId: existingDriveId,
-        driveLink: existingDriveLink || `https://drive.google.com/file/d/${existingDriveId}/view`,
-        downloadLink: existingDownloadLink || `https://drive.google.com/uc?id=${existingDriveId}&export=download`,
+        r2Key: existingR2Key,
         category: safeCategory,
         alreadySynced: true,
         isDuplicate: true,
-        backedUpToDrive: true,
-        message: `File '${safeFileName}' is already backed up to Drive and synced in Firebase.`
+        backedUpToR2: true,
+        message: `File '${safeFileName}' is already backed up to Cloudflare R2.`
       });
     }
 
@@ -444,7 +283,7 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
       return res.status(403).json({ error: 'Storage quota exceeded for your tier' });
     }
 
-    // 1. Ensure file is saved locally in server storage under username/category as fallback/staging
+    // 1. Ensure file is saved locally in server storage as staging/fallback
     try {
       const localDir = getLocalUserPath(email, safeCategory);
       const localFilePath = path.join(localDir, `${itemId}.enc`);
@@ -459,162 +298,54 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
       console.error('Local save error:', saveErr.message);
     }
 
-    // 2. CRITICAL: Upload to Google Drive FIRST.
-    // Photos, videos, documents, and all other details will ONLY be saved to Firebase
-    // if Google Drive backup is 100% successful!
-    if (!drive) {
-      initGoogleDrive();
-    }
+    // 2. Upload to Cloudflare R2 Object Storage
+    let r2Key = null;
+    const objectKey = getR2ObjectKey(email, safeCategory, `${itemId}.enc`);
 
-    if (!drive) {
-      return res.status(502).json({
-        success: false,
-        error: 'Google Drive is not connected or initialized. File details cannot be saved to Firebase without successful Google Drive backup.'
-      });
-    }
+    if (r2Client) {
+      try {
+        const fileStream = uploadedFilePath && fs.existsSync(uploadedFilePath)
+          ? fs.createReadStream(uploadedFilePath)
+          : req.file?.buffer;
 
-    let driveFileId = null;
-    let driveWebViewLink = null;
-    let driveDownloadLink = null;
-
-    try {
-      const targetFolderId = await resolveUserCategoryFolder(email, safeCategory);
-
-      // Check if file with same itemId or fileName already exists in Drive folder
-      const existingQuery = `'${targetFolderId}' in parents and name = '${itemId}.enc' and trashed = false`;
-      const existingRes = await drive.files.list({
-        q: existingQuery,
-        fields: 'files(id, name, size, webViewLink, webContentLink)',
-        spaces: 'drive',
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true
-      });
-
-      if (existingRes.data.files && existingRes.data.files.length > 0) {
-        const fileObj = existingRes.data.files[0];
-        driveFileId = fileObj.id;
-        driveWebViewLink = fileObj.webViewLink || `https://drive.google.com/file/d/${driveFileId}/view?usp=drivesdk`;
-        driveDownloadLink = fileObj.webContentLink || `https://drive.google.com/uc?id=${driveFileId}&export=download`;
-        console.log(`ℹ️ [Drive Found] '${itemId}.enc' already present in Drive (ID: ${driveFileId}).`);
-      } else {
-        // High-speed direct streaming to Google Drive
-        let mediaBody;
-        if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
-          mediaBody = fs.createReadStream(uploadedFilePath);
-        } else if (req.file?.buffer) {
-          const bufferStream = new stream.PassThrough();
-          bufferStream.end(req.file.buffer);
-          mediaBody = bufferStream;
-        }
-
-        const driveRes = await drive.files.create({
-          requestBody: {
-            name: `${itemId}.enc`,
-            mimeType: 'application/octet-stream',
-            parents: targetFolderId ? [targetFolderId] : undefined,
-            description: `DialerVault Backup: ${safeFileName} (${safeCategory})`
-          },
-          media: {
-            mimeType: 'application/octet-stream',
-            body: mediaBody
-          },
-          fields: 'id, name, webViewLink, webContentLink, size, mimeType',
-          supportsAllDrives: true
-        });
-
-        driveFileId = driveRes.data.id;
-        driveWebViewLink = driveRes.data.webViewLink || `https://drive.google.com/file/d/${driveFileId}/view?usp=drivesdk`;
-        driveDownloadLink = driveRes.data.webContentLink || `https://drive.google.com/uc?id=${driveFileId}&export=download`;
-
-        // Cloud backups remain strictly private to the authenticated account
-        console.log(`✅ [Uploaded to Drive] '${safeFileName}' (${itemId}.enc) -> ID: ${driveFileId}`);
-      }
-    } catch (driveErr) {
-      console.error(`❌ [Google Drive Backup Failed] '${safeFileName}':`, driveErr.message);
-
-      // If OAuth failed with invalid_grant or auth error, automatically attempt fallback to Service Account!
-      if (driveErr.message && (driveErr.message.includes('invalid_grant') || driveErr.message.includes('auth') || driveErr.message.includes('token') || driveErr.message.includes('credentials'))) {
-        try {
-          let serviceAccountCreds = null;
-          if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-            serviceAccountCreds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-          } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-            serviceAccountCreds = require(process.env.GOOGLE_APPLICATION_CREDENTIALS);
-          } else {
-            try { serviceAccountCreds = require('./google-service-account.json'); } catch (_) {}
+        await r2Client.send(new PutObjectCommand({
+          Bucket: R2_BUCKET_NAME,
+          Key: objectKey,
+          Body: fileStream,
+          ContentType: 'application/octet-stream',
+          Metadata: {
+            itemId,
+            fileName: safeFileName,
+            category: safeCategory,
+            email: email.trim().toLowerCase()
           }
+        }));
 
-          if (serviceAccountCreds) {
-            console.log('🔄 Retrying Google Drive upload with Service Account fallback...');
-            const auth = new google.auth.GoogleAuth({
-              credentials: serviceAccountCreds,
-              scopes: ['https://www.googleapis.com/auth/drive']
-            });
-            drive = google.drive({ version: 'v3', auth });
-
-            const targetFolderId = await resolveUserCategoryFolder(email, safeCategory);
-            let retryMediaBody;
-            if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
-              retryMediaBody = fs.createReadStream(uploadedFilePath);
-            } else if (req.file?.buffer) {
-              const bufferStream = new stream.PassThrough();
-              bufferStream.end(req.file.buffer);
-              retryMediaBody = bufferStream;
-            }
-
-            const retryDriveRes = await drive.files.create({
-              requestBody: {
-                name: `${itemId}.enc`,
-                mimeType: 'application/octet-stream',
-                parents: targetFolderId ? [targetFolderId] : undefined,
-                description: `DialerVault Backup: ${safeFileName} (${safeCategory})`
-              },
-              media: {
-                mimeType: 'application/octet-stream',
-                body: retryMediaBody
-              },
-              fields: 'id, name, webViewLink, webContentLink, size, mimeType',
-              supportsAllDrives: true
-            });
-
-            driveFileId = retryDriveRes.data.id;
-            driveWebViewLink = retryDriveRes.data.webViewLink || `https://drive.google.com/file/d/${driveFileId}/view?usp=drivesdk`;
-            driveDownloadLink = retryDriveRes.data.webContentLink || `https://drive.google.com/uc?id=${driveFileId}&export=download`;
-            console.log(`✅ [Service Account Retry Succeeded] '${safeFileName}' -> ID: ${driveFileId}`);
-          }
-        } catch (retryErr) {
-          console.error(`❌ [Service Account Retry Also Failed]:`, retryErr.message);
-        }
-      }
-
-      if (!driveFileId) {
-        console.warn(`⚠️ [Cloud Notice] Drive unavailable (${driveErr.message}). Storing securely in Central Cloud Server Storage and syncing to Firebase.`);
-        driveFileId = 'local_vault_storage';
-        driveWebViewLink = `${process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : 'https://dialervaultbckend-production.up.railway.app'}/api/backup/download?email=${encodeURIComponent(email)}&itemId=${encodeURIComponent(itemId)}`;
-        driveDownloadLink = driveWebViewLink;
+        r2Key = objectKey;
+        console.log(`✅ [Uploaded to Cloudflare R2] '${safeFileName}' (${itemId}.enc) -> ${objectKey}`);
+      } catch (r2Err) {
+        console.error(`❌ [Cloudflare R2 Upload Failed] '${safeFileName}':`, r2Err.message);
       }
     }
 
-    if (!driveFileId) {
-      driveFileId = 'local_vault_storage';
-      driveWebViewLink = `${process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : 'https://dialervaultbckend-production.up.railway.app'}/api/backup/download?email=${encodeURIComponent(email)}&itemId=${encodeURIComponent(itemId)}`;
-      driveDownloadLink = driveWebViewLink;
+    if (!r2Key) {
+      r2Key = 'local_vault_storage';
+      console.warn(`ℹ️ [Notice] R2 not configured or failed, stored in central vault storage.`);
     }
 
-    // 3. NOW AND ONLY NOW: Save in Firebase Realtime Database
-    // Store complete file details, Drive links, category, and metadata!
-    const effectiveDriveLink = driveWebViewLink || `https://drive.google.com/file/d/${driveFileId}/view?usp=drivesdk`;
-    const effectiveDownloadLink = driveDownloadLink || `https://drive.google.com/uc?id=${driveFileId}&export=download`;
+    // 3. Save metadata to Firebase Realtime Database
+    const downloadUrl = `${process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : 'https://dialervaultbckend-production.up.railway.app'}/api/backup/download?email=${encodeURIComponent(email)}&itemId=${encodeURIComponent(itemId)}`;
 
     const fileMetadata = {
       itemId,
       fileName: safeFileName,
       category: safeCategory,
       fileSizeBytes: bytes,
-      driveFileId,
-      driveLink: effectiveDriveLink,
-      webViewLink: effectiveDriveLink,
-      downloadLink: effectiveDownloadLink,
+      r2Key,
+      driveFileId: r2Key, // maintain backward compatibility with client
+      driveLink: downloadUrl,
+      downloadLink: downloadUrl,
+      backedUpToR2: true,
       backedUpToDrive: true,
       email: email.trim().toLowerCase(),
       uploadedAt: Date.now()
@@ -623,23 +354,12 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
     userQuota.usedBytes += bytes;
 
     if (firebaseDb) {
-      // Atomic multi-path update in a single network round-trip
       const updates = {};
       updates[`users/${userName}/${safeCategory}/${fileKey}`] = fileMetadata;
       updates[`users/${userName}/files/${itemId}`] = fileMetadata;
-      updates[`users/${userName}/links/${itemId}`] = {
-        itemId,
-        fileName: safeFileName,
-        category: safeCategory,
-        driveFileId,
-        driveLink: effectiveDriveLink,
-        downloadLink: effectiveDownloadLink,
-        uploadedAt: fileMetadata.uploadedAt
-      };
       updates[`users/${userName}/quota`] = userQuota;
       updates[`users/${key}/quota`] = userQuota;
       updates[`users/${key}/files/${itemId}`] = fileMetadata;
-
       await firebaseDb.ref().update(updates);
     } else {
       if (!localDb.files[userName]) localDb.files[userName] = {};
@@ -652,28 +372,27 @@ app.post('/api/backup/upload', upload.single('file'), async (req, res) => {
       success: true,
       itemId,
       fileName: safeFileName,
-      driveFileId,
-      driveLink: effectiveDriveLink,
-      webViewLink: effectiveDriveLink,
-      downloadLink: effectiveDownloadLink,
+      r2Key,
+      driveFileId: r2Key,
+      driveLink: downloadUrl,
+      downloadLink: downloadUrl,
       category: safeCategory,
-      backedUpToDrive: true,
+      backedUpToR2: true,
       usedBytes: userQuota.usedBytes,
       alreadySynced: false,
-      message: `Successfully backed up '${safeFileName}' to Google Drive and recorded links in Firebase!`
+      message: `Successfully backed up '${safeFileName}' to Cloudflare R2 and synced metadata!`
     });
   } catch (err) {
     console.error('Upload error:', err);
     res.status(500).json({ error: err.message });
   } finally {
-    // Clean up temporary upload file
     if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
       try { fs.unlinkSync(uploadedFilePath); } catch (_) {}
     }
   }
 });
 
-// Upload Vault Manifest (vault_index.json) - DELETES old copy and replaces fresh every time!
+// Upload Vault Manifest (vault_index.json) to Cloudflare R2
 app.post('/api/backup/manifest', upload.single('manifest'), async (req, res) => {
   const manifestFilePath = req.file?.path;
   try {
@@ -689,7 +408,7 @@ app.post('/api/backup/manifest', upload.single('manifest'), async (req, res) => 
     const userName = getUserName(email);
     const key = cleanEmailKey(email);
 
-    // Save manifest locally on server
+    // 1. Save manifest locally on server
     try {
       const localDir = getLocalUserPath(email, 'Manifest');
       fs.writeFileSync(path.join(localDir, 'vault_index.json'), manifestBuffer);
@@ -697,80 +416,30 @@ app.post('/api/backup/manifest', upload.single('manifest'), async (req, res) => 
       console.error('Manifest local save error:', mErr.message);
     }
 
-    if (drive) {
+    // 2. Upload manifest to Cloudflare R2
+    const manifestR2Key = `${APP_PACKAGE_NAME}/${userName}/Manifest/vault_index.json`;
+    if (r2Client) {
       try {
-        const rootId = process.env.GOOGLE_DRIVE_FOLDER_ID;
-        const appPackageFolderId = await getOrCreateDriveFolder(rootId, APP_PACKAGE_NAME);
-        const parentForUser = appPackageFolderId || rootId;
-
-        const userNameFolder = getUserName(email);
-        const userFolderId = await getOrCreateDriveFolder(parentForUser, userNameFolder);
-        const targetParent = userFolderId || rootId;
-
-        // 1. Find ALL old vault_index.json files in this user's Google Drive folder
-        const checkQuery = `'${targetParent}' in parents and name = 'vault_index.json' and trashed = false`;
-        const existingRes = await drive.files.list({
-          q: checkQuery,
-          fields: 'files(id, name)',
-          spaces: 'drive',
-          supportsAllDrives: true,
-          includeItemsFromAllDrives: true
-        });
-
-        // 2. DELETE all old copies from Google Drive!
-        if (existingRes.data.files && existingRes.data.files.length > 0) {
-          for (const oldFile of existingRes.data.files) {
-            try {
-              await drive.files.delete({
-                fileId: oldFile.id,
-                supportsAllDrives: true
-              });
-              console.log(`🗑️ [Old Manifest Deleted] Deleted old vault_index.json (ID: ${oldFile.id}) from Google Drive.`);
-            } catch (delErr) {
-              console.warn(`Could not delete old manifest ${oldFile.id}:`, delErr.message);
-            }
-          }
-        }
-
-        // 3. Create fresh, single copy of vault_index.json
-        const bufferStream = new stream.PassThrough();
-        bufferStream.end(manifestBuffer);
-
-        const createRes = await drive.files.create({
-          requestBody: {
-            name: 'vault_index.json',
-            mimeType: 'application/json',
-            parents: targetParent ? [targetParent] : undefined
-          },
-          media: {
-            mimeType: 'application/json',
-            body: bufferStream
-          },
-          fields: 'id, name, webViewLink, webContentLink',
-          supportsAllDrives: true
-        });
-        const manifestDriveId = createRes.data.id;
-        const manifestDriveLink = createRes.data.webViewLink || `https://drive.google.com/file/d/${manifestDriveId}/view`;
-        console.log(`✅ [Fresh Manifest Created] New vault_index.json saved in Google Drive (ID: ${manifestDriveId}, Link: ${manifestDriveLink}).`);
-
-        if (firebaseDb) {
-          await firebaseDb.ref(`users/${userName}/manifest_drive_link`).set(manifestDriveLink);
-          await firebaseDb.ref(`users/${userName}/manifest_drive_id`).set(manifestDriveId);
-          await firebaseDb.ref(`users/${key}/manifest_drive_link`).set(manifestDriveLink);
-        }
-      } catch (dErr) {
-        console.warn(`[Drive Notice] Manifest drive write skipped: ${dErr.message}`);
+        await r2Client.send(new PutObjectCommand({
+          Bucket: R2_BUCKET_NAME,
+          Key: manifestR2Key,
+          Body: manifestBuffer,
+          ContentType: 'application/json'
+        }));
+        console.log(`✅ [Fresh Manifest Created] vault_index.json saved to Cloudflare R2 (${manifestR2Key}).`);
+      } catch (r2Err) {
+        console.warn(`[R2 Notice] Manifest R2 write skipped: ${r2Err.message}`);
       }
     }
 
-    // Save manifest in Firebase under users/<username>/manifest
+    // 3. Save manifest in Firebase under users/<username>/manifest
     if (firebaseDb) {
       const manifestStr = manifestBuffer.toString('utf-8');
       await firebaseDb.ref(`users/${userName}/manifest`).set(manifestStr);
       await firebaseDb.ref(`users/${key}/manifest`).set(manifestStr);
     }
 
-    res.json({ success: true, message: 'Manifest cleanly replaced and backed up with Drive verification!' });
+    res.json({ success: true, message: 'Manifest cleanly backed up to Cloudflare R2 & Firebase!' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   } finally {
@@ -780,7 +449,7 @@ app.post('/api/backup/manifest', upload.single('manifest'), async (req, res) => 
   }
 });
 
-// Endpoint to fetch all backed-up Google Drive links stored in Firebase
+// Endpoint to fetch all backed-up items stored in Firebase
 app.get('/api/backup/drive-links', async (req, res) => {
   try {
     const email = req.query.email;
@@ -802,16 +471,18 @@ app.get('/api/backup/drive-links', async (req, res) => {
       filesObj = localDb.files[userName] || {};
     }
 
-    const driveLinks = [];
+    const links = [];
     for (const [id, meta] of Object.entries(filesObj)) {
-      if (meta && (meta.backedUpToDrive || (meta.driveFileId && meta.driveFileId !== 'local_vault_storage'))) {
-        driveLinks.push({
+      if (meta) {
+        const downloadUrl = `${process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : 'https://dialervaultbckend-production.up.railway.app'}/api/backup/download?email=${encodeURIComponent(email)}&itemId=${encodeURIComponent(meta.itemId || id)}`;
+        links.push({
           itemId: meta.itemId || id,
           fileName: meta.fileName,
           category: meta.category,
-          driveFileId: meta.driveFileId,
-          driveLink: meta.driveLink || meta.webViewLink || `https://drive.google.com/file/d/${meta.driveFileId}/view`,
-          downloadLink: meta.downloadLink || `https://drive.google.com/uc?id=${meta.driveFileId}&export=download`,
+          r2Key: meta.r2Key || meta.driveFileId,
+          driveFileId: meta.r2Key || meta.driveFileId,
+          driveLink: downloadUrl,
+          downloadLink: downloadUrl,
           fileSizeBytes: meta.fileSizeBytes || 0,
           uploadedAt: meta.uploadedAt
         });
@@ -822,8 +493,8 @@ app.get('/api/backup/drive-links', async (req, res) => {
       success: true,
       email,
       userName,
-      count: driveLinks.length,
-      links: driveLinks
+      count: links.length,
+      links
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -868,10 +539,10 @@ app.get('/api/backup/manifest', async (req, res) => {
     if (!email) return res.status(400).json({ error: 'Email parameter required' });
 
     const key = cleanEmailKey(email);
+    const userName = getUserName(email);
 
     // 1. Check Firebase first for fast instant download
     if (firebaseDb) {
-      const userName = getUserName(email);
       let snap = await firebaseDb.ref(`users/${userName}/manifest`).once('value');
       if (!snap.exists()) {
         snap = await firebaseDb.ref(`users/${key}/manifest`).once('value');
@@ -882,55 +553,26 @@ app.get('/api/backup/manifest', async (req, res) => {
       }
     }
 
-    // 2. Check local server storage
+    // 2. Check Cloudflare R2
+    if (r2Client) {
+      try {
+        const manifestR2Key = `${APP_PACKAGE_NAME}/${userName}/Manifest/vault_index.json`;
+        const r2Res = await r2Client.send(new GetObjectCommand({
+          Bucket: R2_BUCKET_NAME,
+          Key: manifestR2Key
+        }));
+        res.type('json');
+        return r2Res.Body.pipe(res);
+      } catch (r2Err) {
+        console.warn(`R2 manifest fetch failed: ${r2Err.message}`);
+      }
+    }
+
+    // 3. Check local server storage
     const localDir = getLocalUserPath(email, 'Manifest');
     const localManifest = path.join(localDir, 'vault_index.json');
     if (fs.existsSync(localManifest)) {
       return res.sendFile(localManifest);
-    }
-
-    // 3. Fallback: Query Google Drive
-    if (drive) {
-      const rootId = process.env.GOOGLE_DRIVE_FOLDER_ID;
-      const appPackageFolderId = await getOrCreateDriveFolder(rootId, APP_PACKAGE_NAME);
-      const parentForUser = appPackageFolderId || rootId;
-      const userNameFolder = getUserName(email);
-      const userFolderId = await getOrCreateDriveFolder(parentForUser, userNameFolder);
-      const targetParent = userFolderId || rootId;
-
-      // Search in target user folder first
-      let q = `'${targetParent}' in parents and name = 'vault_index.json' and trashed = false`;
-      let list = await drive.files.list({
-        q,
-        fields: 'files(id, name)',
-        spaces: 'drive',
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true
-      });
-
-      // If not found, try legacy query in root or any parent matching email/username
-      if (!list.data.files || list.data.files.length === 0) {
-        const legacyUserFolderId = await getOrCreateDriveFolder(rootId, email.trim().toLowerCase());
-        if (legacyUserFolderId && legacyUserFolderId !== targetParent) {
-          q = `'${legacyUserFolderId}' in parents and name = 'vault_index.json' and trashed = false`;
-          list = await drive.files.list({
-            q,
-            fields: 'files(id, name)',
-            spaces: 'drive',
-            supportsAllDrives: true,
-            includeItemsFromAllDrives: true
-          });
-        }
-      }
-
-      if (list.data.files && list.data.files.length > 0) {
-        const fileId = list.data.files[0].id;
-        const driveStream = await drive.files.get(
-          { fileId, alt: 'media', supportsAllDrives: true },
-          { responseType: 'stream' }
-        );
-        return driveStream.data.pipe(res);
-      }
     }
 
     res.status(404).json({ error: 'No backup manifest found for this email' });
@@ -939,76 +581,43 @@ app.get('/api/backup/manifest', async (req, res) => {
   }
 });
 
-// Download individual file chunk by itemId
+// Download individual file chunk by itemId (from Cloudflare R2 or local vault storage)
 app.get('/api/backup/download', async (req, res) => {
   try {
     const { email, itemId } = req.query;
     let driveFileId = req.query.driveFileId;
     if (!email || !itemId) return res.status(400).json({ error: 'Missing email or itemId' });
 
-    // 1. If driveFileId was directly provided by client and is valid, stream it immediately
-    if (drive && driveFileId && driveFileId !== 'local_vault_storage' && driveFileId !== 'simulated_id' && driveFileId.trim() !== '') {
-      try {
-        const driveStream = await drive.files.get(
-          { fileId: driveFileId.trim(), alt: 'media', supportsAllDrives: true },
-          { responseType: 'stream' }
-        );
-        return driveStream.data.pipe(res);
-      } catch (dErr) {
-        console.warn(`Direct driveFileId stream failed (${driveFileId}): ${dErr.message}`);
+    const userName = getUserName(email);
+
+    // 1. Check Cloudflare R2 directly if r2Client is ready
+    if (r2Client) {
+      const possibleKeys = [
+        driveFileId,
+        `${APP_PACKAGE_NAME}/${userName}/Photos/${itemId}.enc`,
+        `${APP_PACKAGE_NAME}/${userName}/Videos/${itemId}.enc`,
+        `${APP_PACKAGE_NAME}/${userName}/Audio/${itemId}.enc`,
+        `${APP_PACKAGE_NAME}/${userName}/Documents/${itemId}.enc`,
+        `${APP_PACKAGE_NAME}/${userName}/Archives/${itemId}.enc`,
+        `${APP_PACKAGE_NAME}/${userName}/General/${itemId}.enc`
+      ].filter(k => k && k !== 'local_vault_storage' && k !== 'simulated_id');
+
+      for (const keyToTry of possibleKeys) {
+        try {
+          const r2Res = await r2Client.send(new GetObjectCommand({
+            Bucket: R2_BUCKET_NAME,
+            Key: keyToTry
+          }));
+          res.setHeader('Content-Type', 'application/octet-stream');
+          return r2Res.Body.pipe(res);
+        } catch (_) {}
       }
     }
 
-    // 2. Check local server vault storage first
+    // 2. Check local server vault storage
     const localFile = findLocalFile(email, itemId);
     if (localFile && fs.existsSync(localFile)) {
       return res.sendFile(localFile);
-    }
-
-    const key = cleanEmailKey(email);
-
-    // 3. Look up driveFileId from Firebase metadata if not provided or direct stream failed
-    if (firebaseDb) {
-      const userName = getUserName(email);
-      let snap = await firebaseDb.ref(`users/${userName}/files/${itemId}`).once('value');
-      if (!snap.exists()) {
-        snap = await firebaseDb.ref(`users/${key}/files/${itemId}`).once('value');
-      }
-      if (snap.exists()) {
-        driveFileId = snap.val().driveFileId;
-      }
-    }
-
-    // 4. Stream directly from Google Drive if driveFileId obtained from Firebase
-    if (drive && driveFileId && driveFileId !== 'local_vault_storage' && driveFileId !== 'simulated_id' && driveFileId.trim() !== '') {
-      try {
-        const driveStream = await drive.files.get(
-          { fileId: driveFileId.trim(), alt: 'media', supportsAllDrives: true },
-          { responseType: 'stream' }
-        );
-        return driveStream.data.pipe(res);
-      } catch (dErr) {
-        console.warn(`Drive download stream from Firebase ID failed: ${dErr.message}`);
-      }
-    }
-
-    // 5. Fallback search by filename in Drive across all drives
-    if (drive) {
-      const q = `name = '${itemId}.enc' and trashed = false`;
-      const list = await drive.files.list({
-        q,
-        fields: 'files(id, name)',
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true
-      });
-      if (list.data.files && list.data.files.length > 0) {
-        const fileId = list.data.files[0].id;
-        const driveStream = await drive.files.get(
-          { fileId, alt: 'media', supportsAllDrives: true },
-          { responseType: 'stream' }
-        );
-        return driveStream.data.pipe(res);
-      }
     }
 
     res.status(404).json({ error: 'File not found in cloud backup' });
