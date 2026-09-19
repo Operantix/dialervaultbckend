@@ -29,6 +29,8 @@ const detailUserEmail = document.getElementById('detailUserEmail');
 const detailTotalFilesPill = document.getElementById('detailTotalFilesPill');
 const detailTotalSizePill = document.getElementById('detailTotalSizePill');
 const btnRecoverManifest = document.getElementById('btnRecoverManifest');
+const btnWipeUserFiles = document.getElementById('btnWipeUserFiles');
+const btnDeleteUserAccount = document.getElementById('btnDeleteUserAccount');
 
 // Section Tabs
 const tabBtnDecrypted = document.getElementById('tabBtnDecrypted');
@@ -118,6 +120,20 @@ btnRecoverManifest.addEventListener('click', () => {
   const downloadUrl = `${baseUrl}/api/admin/user/${encodeURIComponent(currentUserKey)}/recover/manifest?adminKey=${encodeURIComponent(key)}`;
   triggerDownload(downloadUrl, `${currentUserKey}_vault_index.json`);
 });
+
+// Wipe All Files Button (User Vault)
+if (btnWipeUserFiles) {
+  btnWipeUserFiles.addEventListener('click', () => {
+    if (currentUserKey) wipeUserFiles(currentUserKey);
+  });
+}
+
+// Delete User Account Button (User Vault)
+if (btnDeleteUserAccount) {
+  btnDeleteUserAccount.addEventListener('click', () => {
+    if (currentUserKey) deleteUserAccount(currentUserKey);
+  });
+}
 
 // Recover All Decrypted
 btnRecoverAllDecrypted.addEventListener('click', () => {
@@ -252,9 +268,14 @@ function renderUsers() {
         <td>${u.isLifetime100GB ? '⭐️ 100 GB Lifetime' : 'Free Tier (1 GB)'}</td>
         <td>${formatDate(u.lastBackupTime)}</td>
         <td>
-          <button class="btn-view-files" onclick="openFullUserVault('${escapeHtml(u.userKey)}', '${escapeHtml(u.email)}')">
-            Open Vault Page &rarr;
-          </button>
+          <div style="display: flex; gap: 8px;">
+            <button class="btn-view-files" onclick="openFullUserVault('${escapeHtml(u.userKey)}', '${escapeHtml(u.email)}')">
+              Open Vault &rarr;
+            </button>
+            <button class="btn-action-delete" onclick="deleteUserAccount('${escapeHtml(u.userKey)}')">
+              🗑️ Delete
+            </button>
+          </div>
         </td>
       </tr>
     `;
@@ -288,6 +309,10 @@ window.openFullUserVault = async function(userKey, email) {
   decryptedFilesTableBody.innerHTML = `<tr><td colspan="6" class="loading-cell">Loading files from database &amp; Cloudflare R2...</td></tr>`;
   encryptedFilesTableBody.innerHTML = `<tr><td colspan="6" class="loading-cell">Loading encrypted files...</td></tr>`;
 
+  await reloadUserFiles(userKey);
+};
+
+async function reloadUserFiles(userKey) {
   const baseUrl = serverUrlInput.value.trim().replace(/\/$/, '');
   const key = adminKeyInput.value.trim();
 
@@ -308,7 +333,7 @@ window.openFullUserVault = async function(userKey, email) {
   } catch (err) {
     decryptedFilesTableBody.innerHTML = `<tr><td colspan="6" class="loading-cell" style="color: var(--danger)">Failed to load vault files: ${err.message}</td></tr>`;
   }
-};
+}
 
 function updateBoxCounts() {
   boxCountAll.textContent = `${currentFiles.length} files`;
@@ -343,9 +368,6 @@ function renderDecryptedSection() {
     return;
   }
 
-  const baseUrl = serverUrlInput.value.trim().replace(/\/$/, '');
-  const key = adminKeyInput.value.trim();
-
   decryptedFilesTableBody.innerHTML = files.map(f => {
     const isDownloaded = downloadedFileIds.has(f.itemId);
     const statusBadge = isDownloaded
@@ -366,9 +388,14 @@ function renderDecryptedSection() {
         <td>${statusBadge}</td>
         <td>${formatDate(f.uploadedAt)}</td>
         <td>
-          <button class="btn-action-decrypted" onclick="recoverSingleFile('${escapeHtml(f.itemId)}', '${escapeHtml(f.fileName)}', 'decrypted')">
-            🔓 Recover Decrypted
-          </button>
+          <div style="display: flex; gap: 6px;">
+            <button class="btn-action-decrypted" onclick="recoverSingleFile('${escapeHtml(f.itemId)}', '${escapeHtml(f.fileName)}', 'decrypted')">
+              🔓 Recover
+            </button>
+            <button class="btn-action-delete" onclick="deleteSingleFile('${escapeHtml(f.itemId)}', '${escapeHtml(f.fileName)}')">
+              🗑️ Delete
+            </button>
+          </div>
         </td>
       </tr>
     `;
@@ -383,9 +410,6 @@ function renderEncryptedSection() {
     return;
   }
 
-  const baseUrl = serverUrlInput.value.trim().replace(/\/$/, '');
-  const key = adminKeyInput.value.trim();
-
   encryptedFilesTableBody.innerHTML = currentFiles.map(f => {
     return `
       <tr>
@@ -395,9 +419,14 @@ function renderEncryptedSection() {
         <td>${formatBytes(f.fileSizeBytes)}</td>
         <td><span class="badge-tag tag-normal">Cloudflare R2 (AES-GCM)</span></td>
         <td>
-          <button class="btn-action-encrypted" onclick="recoverSingleFile('${escapeHtml(f.itemId)}', '${escapeHtml(f.fileName)}', 'encrypted')">
-            🔒 Download .enc
-          </button>
+          <div style="display: flex; gap: 6px;">
+            <button class="btn-action-encrypted" onclick="recoverSingleFile('${escapeHtml(f.itemId)}', '${escapeHtml(f.fileName)}', 'encrypted')">
+              🔒 Download .enc
+            </button>
+            <button class="btn-action-delete" onclick="deleteSingleFile('${escapeHtml(f.itemId)}', '${escapeHtml(f.fileName)}')">
+              🗑️ Delete
+            </button>
+          </div>
         </td>
       </tr>
     `;
@@ -424,6 +453,88 @@ window.recoverSingleFile = function(itemId, fileName, mode) {
   setTimeout(() => {
     progressContainer.classList.add('hidden');
   }, 2500);
+};
+
+// 1. Delete single file
+window.deleteSingleFile = async function(itemId, fileName) {
+  if (!confirm(`Are you sure you want to permanently delete '${fileName || itemId}' from Cloudflare R2 and database?`)) {
+    return;
+  }
+
+  const baseUrl = serverUrlInput.value.trim().replace(/\/$/, '');
+  const key = adminKeyInput.value.trim();
+
+  try {
+    const res = await fetch(`${baseUrl}/api/admin/user/${encodeURIComponent(currentUserKey)}/file/${encodeURIComponent(itemId)}`, {
+      method: 'DELETE',
+      headers: { 'x-admin-key': key }
+    });
+    const data = await res.json();
+    if (res.ok) {
+      alert(`Deleted: ${fileName || itemId}`);
+      await reloadUserFiles(currentUserKey);
+      fetchUsers();
+    } else {
+      alert(`Error: ${data.error || 'Failed to delete file'}`);
+    }
+  } catch (err) {
+    alert(`Error: ${err.message}`);
+  }
+};
+
+// 2. Wipe all user files
+window.wipeUserFiles = async function(userKey) {
+  if (!confirm(`⚠️ DANGER: Are you sure you want to wipe ALL files for user '${userKey}' from Cloudflare R2 and database? This cannot be undone!`)) {
+    return;
+  }
+
+  const baseUrl = serverUrlInput.value.trim().replace(/\/$/, '');
+  const key = adminKeyInput.value.trim();
+
+  try {
+    const res = await fetch(`${baseUrl}/api/admin/user/${encodeURIComponent(userKey)}/files`, {
+      method: 'DELETE',
+      headers: { 'x-admin-key': key }
+    });
+    const data = await res.json();
+    if (res.ok) {
+      alert(`All files for '${userKey}' have been permanently deleted.`);
+      await reloadUserFiles(userKey);
+      fetchUsers();
+    } else {
+      alert(`Error: ${data.error || 'Failed to wipe files'}`);
+    }
+  } catch (err) {
+    alert(`Error: ${err.message}`);
+  }
+};
+
+// 3. Delete user account
+window.deleteUserAccount = async function(userKey) {
+  if (!confirm(`🚨 CRITICAL: Are you sure you want to permanently delete user '${userKey}', their account, and all their cloud files?`)) {
+    return;
+  }
+
+  const baseUrl = serverUrlInput.value.trim().replace(/\/$/, '');
+  const key = adminKeyInput.value.trim();
+
+  try {
+    const res = await fetch(`${baseUrl}/api/admin/user/${encodeURIComponent(userKey)}`, {
+      method: 'DELETE',
+      headers: { 'x-admin-key': key }
+    });
+    const data = await res.json();
+    if (res.ok) {
+      alert(`User '${userKey}' has been completely removed.`);
+      vaultDetailView.classList.add('hidden');
+      usersListView.classList.remove('hidden');
+      fetchUsers();
+    } else {
+      alert(`Error: ${data.error || 'Failed to delete user'}`);
+    }
+  } catch (err) {
+    alert(`Error: ${err.message}`);
+  }
 };
 
 function getCategoryIcon(cat) {

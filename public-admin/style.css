@@ -855,6 +855,56 @@ h1 {
   color: var(--text-main);
 }
 
+.btn-danger-outline {
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid rgba(248, 81, 73, 0.4);
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-danger-outline:hover {
+  background: rgba(248, 81, 73, 0.15);
+  border-color: var(--danger);
+}
+
+.btn-danger-solid {
+  background: #da3633;
+  color: white;
+  border: none;
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.btn-danger-solid:hover {
+  background: #b62324;
+}
+
+.btn-action-delete {
+  background: rgba(248, 81, 73, 0.12);
+  color: var(--danger);
+  border: 1px solid rgba(248, 81, 73, 0.3);
+  padding: 5px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-action-delete:hover {
+  background: rgba(248, 81, 73, 0.25);
+  border-color: var(--danger);
+}
+
 .loading-cell {
   text-align: center;
   padding: 30px !important;
